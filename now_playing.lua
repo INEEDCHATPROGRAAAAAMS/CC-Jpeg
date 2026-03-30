@@ -90,7 +90,7 @@ local function factorize(n)
     local pairs = {}
     for a = 1, math.floor(math.sqrt(n)) do
         if n % a == 0 then
-            pairs[#pairs + 1] = { a, n // a }
+            pairs[#pairs + 1] = { a, math.floor(n / a) }
         end
     end
     return pairs   -- sorted least-balanced → most-balanced
