@@ -8,7 +8,7 @@ local THUMB_ROW_OFFSET = 1
 -- dependencies
 -- ============================================================
 if not fs.exists("/primeui.lua") then
-    local resp = http.get("https://github.com/INEEDCHATPROGRAAAAAMS/CC-Tweaks-video-player-testing/raw/refs/heads/main/primeui.lua")
+    http.get("https://github.com/INEEDCHATPROGRAAAAAMS/CC-Tweaks-video-player-testing/raw/refs/heads/main/primeui.lua")
 end
 if not fs.exists("/pixelbox_lite.lua") then
     http.get("https://github.com/9551-Dev/pixelbox_lite/raw/refs/heads/master/pixelbox_lite.lua")
@@ -233,6 +233,16 @@ local ui_start_row = 1
 local use_monitor = false
 local monitor_device = nil
 
+local UI_COL_WIDTH = 25  -- reserved columns for buttons/text in wide mode
+
+-- Wide when the aspect ratio exceeds 30:20 (1.5:1). 51×19 → wide,
+-- 26×20 → tall. Also refuses wide when there isn't enough room left
+-- of the strip for the artwork.
+local function is_wide_mode(term_w, term_h)
+    if term_w < UI_COL_WIDTH + 8 then return false end
+    return term_w * 20 > term_h * 30
+end
+
 -- Helper: get the active display.
 local function get_active_term()
     return use_monitor and monitor_device or term.current()
@@ -286,35 +296,39 @@ local function update_now_playing(track)
     end)
 end
 
-local function draw_full_ui(track, volume, speed)
+
+
+local function draw_full_ui(track)
     with_active_term(function(active)
         fix_text_colors()
         local term_w, term_h = active.getSize()
-        ui_start_row = math.max(1, term_h - UI_ROWS + 1)
+        local wide = is_wide_mode(term_w, term_h)
 
-        for row = ui_start_row, term_h do
-            term.setCursorPos(1, row)
-            term.clearLine()
+        local ui_x = wide and (term_w - UI_COL_WIDTH + 1) or 1
+        local ui_w = wide and UI_COL_WIDTH or term_w
+        local ui_y = math.max(1, term_h - UI_ROWS + 1)
+
+        for row = ui_y, term_h do
+            if wide then
+                term.setCursorPos(ui_x, row)
+                write((" "):rep(ui_w))
+            else
+                term.setCursorPos(1, row)
+                term.clearLine()
+            end
         end
-
-        term.setCursorPos(1, ui_start_row)
-        print("A/D:Skip   Space:Pause")
-
-        term.setCursorPos(1, ui_start_row + 1)
-        print(("W/S:Vol %.2f Z/C:Spd %.2fx"):format(volume, speed))
 
         local artist = track.artist or "Unknown Artist"
-        local title = track.title or "Unknown Title"
-        local now_playing = "Now: " .. artist .. " - " .. title
-        if #now_playing > term_w then
-            now_playing = now_playing:sub(1, math.max(1, term_w - 3)) .. "..."
+        local title  = track.title  or "Unknown Title"
+        local now_str = "Now: " .. title .. " - " .. artist
+        if #now_str > ui_w then
+            now_str = now_str:sub(1, math.max(1, ui_w - 3)) .. "..."
         end
 
-        term.setCursorPos(1, ui_start_row + 2)
-        print(now_playing)
+        term.setCursorPos(ui_x, ui_y)
+        write(now_str)
     end)
 end
-
 -- PrimeUI-backed playback controls. PrimeUI handles mouse_click for an
 -- internal touchscreen terminal and monitor_touch for an external monitor.
 local playback_ui_generation = 0
@@ -322,15 +336,29 @@ local playback_ui_generation = 0
 local function draw_touch_buttons(track, input_state)
     local active = get_active_term()
     local periph = get_active_periph_name()
-
     local old = term.current()
     term.redirect(active)
-    -- PrimeUI.clear() is deliberately done by play_track_buffered() before
-    -- the album art is rendered. Do not clear here, or the artwork disappears.
     fix_text_colors()
 
     local w, h = active.getSize()
-    local y = h
+    local wide = is_wide_mode(w, h)
+    local ui_x = wide and (w - UI_COL_WIDTH + 1) or 1
+    local ui_w = wide and UI_COL_WIDTH or w
+    local row2_y = h - 2
+    local row3_y = h - 1
+    local row4_y = h
+
+    local vol_val_x, spd_val_x
+
+    local function redraw_values()
+        if not vol_val_x then return end
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.setCursorPos(vol_val_x, row3_y)
+        write(("%.2f"):format(input_state.volume))
+        term.setCursorPos(spd_val_x, row4_y)
+        write(("%.2fx"):format(input_state.speed))
+    end
 
     local function action(fn)
         return function()
@@ -339,63 +367,115 @@ local function draw_touch_buttons(track, input_state)
         end
     end
 
-    local function btn(x, label, fn)
-        if x + #label + 1 <= w then
-            PrimeUI.button(active, x, y, label, action(fn), colors.white, colors.gray, colors.lightGray, periph)
+    -- Lay the speed row out first. It has four items (Spd-, value, Spd+,
+    -- Back), so it drives the anchors. The volume row reuses the first
+    -- three positions so Vol-/Spd-, the two readouts, and Vol+/Spd+
+    -- line up column-for-column.
+    local spd_items = {
+        {label = "Spd-", fn = function()
+            input_state.speed = math.max(0.25, input_state.speed - 0.01)
+            save_settings(input_state.volume, input_state.speed, use_monitor)
+            redraw_values()
+        end},
+        {width = 5},  -- "1.00x"
+        {label = "Spd+", fn = function()
+            input_state.speed = math.min(3.0, input_state.speed + 0.01)
+            save_settings(input_state.volume, input_state.speed, use_monitor)
+            redraw_values()
+        end},
+        {label = "Back", fn = function() input_state.back = true end},
+    }
+    local vol_items = {
+        {label = "Vol-", fn = function()
+            input_state.volume = math.max(0.05, input_state.volume - 0.05)
+            save_settings(input_state.volume, input_state.speed, use_monitor)
+            redraw_values()
+        end},
+        {width = 4},  -- "1.00"
+        {label = "Vol+", fn = function()
+            input_state.volume = math.min(2.0, input_state.volume + 0.05)
+            save_settings(input_state.volume, input_state.speed, use_monitor)
+            redraw_values()
+        end},
+    }
+    local row2_items = {
+        {label = "<<", fn = function() input_state.skip_back = true end},
+        {label = input_state.paused and "Play" or "Pause",
+         fn = function() input_state.paused = not input_state.paused end},
+        {label = ">>", fn = function() input_state.skip_forward = true end},
+    }
+
+    local function layout(items)
+        local n = #items
+        local widths, total = {}, 0
+        for i, it in ipairs(items) do
+            widths[i] = it.width or (#it.label + 1)
+            total = total + widths[i]
         end
+        local positions = {}
+        local x = ui_x
+        if n > 1 then
+            local gap_space = math.max(n - 1, ui_w - total)
+            local base  = math.floor(gap_space / (n - 1))
+            local extra = gap_space - base * (n - 1)
+            for i = 1, n do
+                positions[i] = x
+                x = x + widths[i]
+                if i < n then
+                    x = x + base + (i <= extra and 1 or 0)
+                end
+            end
+        else
+            positions[1] = ui_x
+        end
+        return positions
     end
 
-    -- Queue navigation: previous track only.
-    btn(1, "<<", function() input_state.skip_back = true end)
-    btn(5, input_state.paused and "Play" or "Pause", function()
-        input_state.paused = not input_state.paused
-    end)
-    btn(17, ">>", function() input_state.skip_forward = true end)
-    btn(21, "Vol+", function()
-        input_state.volume = math.min(2.0, input_state.volume + 0.05)
-        save_settings(input_state.volume, input_state.speed, use_monitor)
-        update_volume_speed(input_state.volume, input_state.speed)
-    end)
-    btn(27, "Vol-", function()
-        input_state.volume = math.max(0.05, input_state.volume - 0.05)
-        save_settings(input_state.volume, input_state.speed, use_monitor)
-        update_volume_speed(input_state.volume, input_state.speed)
-    end)
-    btn(33, "Spd+", function()
-        input_state.speed = math.min(3.0, input_state.speed + 0.01)
-        save_settings(input_state.volume, input_state.speed, use_monitor)
-        update_volume_speed(input_state.volume, input_state.speed)
-    end)
-    btn(39, "Spd-", function()
-        input_state.speed = math.max(0.25, input_state.speed - 0.01)
-        save_settings(input_state.volume, input_state.speed, use_monitor)
-        update_volume_speed(input_state.volume, input_state.speed)
-    end)
-    -- Navigation: leave playback and return to track selection.
-    btn(45, "Back", function() input_state.back = true end)
+    local p2 = layout(row2_items)
+    local p4 = layout(spd_items)
+    -- Volume row shares the speed row's anchors. Its value slot is narrower
+    -- ("1.00" vs "1.00x"), so Vol+ still lands on the same x as Spd+.
+    local p3 = { p4[1], p4[2], p4[3] }
 
+    vol_val_x = p3[2]
+    spd_val_x = p4[2]
+
+    local function draw_row(items, positions, y)
+        for i, it in ipairs(items) do
+            if it.label then
+                PrimeUI.button(active, positions[i], y, it.label, action(it.fn),
+                    colors.white, colors.gray, colors.lightGray, periph)
+            end
+        end
+    end
+    draw_row(row2_items, p2, row2_y)
+    draw_row(vol_items,  p3, row3_y)
+    draw_row(spd_items,  p4, row4_y)
+    redraw_values()
+
+    -- Keyboard shortcuts (unchanged)
     PrimeUI.keyAction(keys.a, action(function() input_state.skip_back = true end))
     PrimeUI.keyAction(keys.d, action(function() input_state.skip_forward = true end))
     PrimeUI.keyAction(keys.space, action(function() input_state.paused = not input_state.paused end))
     PrimeUI.keyAction(keys.w, action(function()
         input_state.volume = math.min(2.0, input_state.volume + 0.05)
         save_settings(input_state.volume, input_state.speed, use_monitor)
-        update_volume_speed(input_state.volume, input_state.speed)
+        redraw_values()
     end))
     PrimeUI.keyAction(keys.s, action(function()
         input_state.volume = math.max(0.05, input_state.volume - 0.05)
         save_settings(input_state.volume, input_state.speed, use_monitor)
-        update_volume_speed(input_state.volume, input_state.speed)
+        redraw_values()
     end))
     PrimeUI.keyAction(keys.c, action(function()
         input_state.speed = math.min(3.0, input_state.speed + 0.01)
         save_settings(input_state.volume, input_state.speed, use_monitor)
-        update_volume_speed(input_state.volume, input_state.speed)
+        redraw_values()
     end))
     PrimeUI.keyAction(keys.z, action(function()
         input_state.speed = math.max(0.25, input_state.speed - 0.01)
         save_settings(input_state.volume, input_state.speed, use_monitor)
-        update_volume_speed(input_state.volume, input_state.speed)
+        redraw_values()
     end))
     PrimeUI.keyAction(keys.q, action(function() input_state.back = true end))
 
@@ -403,26 +483,43 @@ local function draw_touch_buttons(track, input_state)
 end
 
 local function get_cover_art_size(term_w, term_h)
-    local image_rows = math.max(0, term_h - UI_ROWS - THUMB_ROW_OFFSET)
-    if image_rows <= 0 then return 64 end
-    local top_pixel_w = term_w * 2
-    local top_pixel_h = image_rows * 3
-    local needed = math.min(top_pixel_w, top_pixel_h)
-    return math.min(needed, MAX_COVER_SIZE)
+    local wide = is_wide_mode(term_w, term_h)
+    local avail_cols, avail_rows
+    if wide then
+        avail_cols = term_w - UI_COL_WIDTH
+        avail_rows = term_h
+    else
+        avail_cols = term_w
+        avail_rows = term_h - UI_ROWS
+    end
+    if avail_cols < 1 or avail_rows < 1 then return 64 end
+    return math.min(math.min(avail_cols * 2, avail_rows * 3), MAX_COVER_SIZE)
 end
 
 local function update_album_art(track, auth_q)
     local active = get_active_term()
     local term_w, term_h = active.getSize()
-    local image_rows = math.max(0, term_h - UI_ROWS)
-    if image_rows <= 0 then
+    local wide = is_wide_mode(term_w, term_h)
+
+    local avail_cols, avail_rows
+    if wide then
+        avail_cols = term_w - UI_COL_WIDTH
+        avail_rows = term_h
+    else
+        avail_cols = term_w
+        avail_rows = term_h - UI_ROWS
+    end
+
+    if avail_cols < 1 or avail_rows < 1 then
         if current_box then current_box:clear(colors.black); current_box:render() end
         fix_text_colors()
         return
     end
-    local top_pixel_h = image_rows * 3
-    local canvas_w = term_w * 2
-    local canvas_h = term_h * 3
+
+    local top_pixel_w = avail_cols * 2
+    local top_pixel_h = avail_rows * 3
+    local canvas_w    = term_w * 2
+    local canvas_h    = term_h * 3
 
     local display = use_monitor and monitor_device or active
     if not current_box or current_box.term ~= display then
@@ -460,7 +557,7 @@ local function update_album_art(track, auth_q)
         return
     end
 
-    local scale = math.min(canvas_w / w, top_pixel_h / h)
+    local scale = math.min(top_pixel_w / w, top_pixel_h / h)
     local sw = math.max(1, math.floor(w * scale))
     local sh = math.max(1, math.floor(h * scale))
     local scaled_rgb = jpeg.scale_fb(src_fb, w, h, sw, sh)
@@ -472,7 +569,8 @@ local function update_album_art(track, auth_q)
     end
 
     local top_canvas = quantize_to_canvas(scaled_rgb, palette, sw, sh)
-    local ox = math.floor((canvas_w - sw) / 2) + 1
+    -- Centre the artwork inside the (possibly strip-narrowed) art region.
+    local ox = math.floor((top_pixel_w - sw) / 2) + 1
     local oy = math.floor((top_pixel_h - sh) / 2) + 1
 
     current_box:clear(colors.black)
@@ -505,8 +603,6 @@ end
 local function play_track_buffered(tr, auth_q, speaker, input_state, volume, speed)
     -- Clear first, then render album art, then text, then PrimeUI controls.
     PrimeUI.clear()
-    update_album_art(tr, auth_q)
-    os.sleep(0.05)
 
     input_state.volume = volume
     input_state.speed = speed
@@ -516,7 +612,10 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
     input_state.back = false
     input_state.cancelled = false
 
-    draw_full_ui(tr, volume, speed)
+    update_album_art(tr, auth_q, input_state)
+    os.sleep(0.05)
+
+    draw_full_ui(tr, volume, speed, input_state)
     draw_touch_buttons(tr, input_state)
 
     local url = BASE_URL.."/rest/stream.view?id="..urlencode(tr.id).."&format=dfpwm"..auth_q
@@ -635,12 +734,6 @@ local function run_play_queue(tracks, auth_q, start_track)
         end
         volume = newVol or volume
         speed = newSpeed or speed
-
-        if idx < #queue then
-            update_now_playing(queue[idx + 1])
-        else
-            update_now_playing(queue[1])
-        end
 
         if input_state.skip_forward then
             idx = idx + 1
