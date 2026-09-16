@@ -1,10 +1,3 @@
--- Navidrome Now Playing multi-monitor display
--- Pixelbox_lite version
---
--- Requires:
---   jpeg_decode.lua
---   pixelbox_lite.lua
---
 -- password.txt:
 --   host=http://192.168.1.100:4533
 --   user=alice
@@ -22,49 +15,14 @@ local SCRIPT_DIR   = fs.getDir(shell.getRunningProgram())
 local LAYOUT_CFG   = SCRIPT_DIR .. "/monitor_layout.cfg"
 local PASSWORD_TXT = SCRIPT_DIR .. "/password.txt"
 
--------------------------------------------------------------------------------
--- Constants
--------------------------------------------------------------------------------
-
 local POLL_INTERVAL    = 1
 local PIXELBOX_COLORS  = 16
 
--- Bezel compensation.
---
--- The monitors in an array have a visible physical frame ("bezel") between
--- them.  To make an image look seamless across the array, we treat the
--- virtual canvas as being (bezel size) larger in each direction than the
--- physical monitor area, letterbox the image into THAT virtual canvas,
--- and then hand each monitor only its own slice — skipping the bezel
--- slices entirely.
---
--- The net effect: content on the two monitors adjacent to a seam is
--- offset from each other by exactly the bezel size, which is what you
--- want (a straight line in the image stays straight; the pixels that
--- would have fallen on the bezel simply don't exist).
---
--- BEZEL_COLS = bezel thickness in character COLUMNS (horizontal seams)
--- BEZEL_ROWS = bezel thickness in character ROWS    (vertical seams)
---
--- A character cell is CHAR_W x CHAR_H pixelbox pixels at text scale 0.5.
---
---   0 = no compensation on that axis (monitors act as one continuous
---       surface, bezel is ignored)
---   1 = one character cell of bezel  (most common)
---   2 = two character cells (thicker monitor frames)
---
--- Tune to match your monitor texture.  Setting these too high over-crops
--- the image; too low and the two sides of the seam won't line up.
-local BEZEL_COLS = 3
+local BEZEL_COLS = 2
 local BEZEL_ROWS = 3
 
--- Pixelbox pixels per monitor character cell at text scale 0.5.
 local CHAR_W = 2
 local CHAR_H = 3
-
--------------------------------------------------------------------------------
--- Helpers
--------------------------------------------------------------------------------
 
 local function trim(s)
     return s:match("^%s*(.-)%s*$")
@@ -81,8 +39,6 @@ local function clamp(v, lo, hi)
 end
 
 local function color_mask(index)
-    -- Pixelbox uses CC color values, which are powers of two.
-    -- index is 1..16.
     return 2 ^ (index - 1)
 end
 
@@ -115,10 +71,6 @@ local function write_lines(path, lines)
     f.close()
 end
 
--------------------------------------------------------------------------------
--- Credentials
--------------------------------------------------------------------------------
-
 local function load_credentials()
     local cfg = read_kv_file(PASSWORD_TXT)
 
@@ -139,10 +91,6 @@ local function load_credentials()
     return cfg
 end
 
--------------------------------------------------------------------------------
--- Monitor discovery
--------------------------------------------------------------------------------
-
 local function find_all_monitors()
     local list = {}
 
@@ -161,11 +109,6 @@ local function find_all_monitors()
 
     return list
 end
-
--------------------------------------------------------------------------------
--- Grid dimension solver
--------------------------------------------------------------------------------
-
 local function factorize(n)
     local pairs_ = {}
 
@@ -233,10 +176,6 @@ local function get_grid_dims(n)
         return b, a
     end
 end
-
--------------------------------------------------------------------------------
--- Layout config
--------------------------------------------------------------------------------
 
 local function save_layout_cfg(layout)
     local lines = {
@@ -341,10 +280,6 @@ local function load_layout_cfg(all_monitors)
         canvas_h = rows * ch * 3,
     }
 end
-
--------------------------------------------------------------------------------
--- Interactive layout setup
--------------------------------------------------------------------------------
 
 local function click_to_pos(k, cols)
     local row = math.ceil(k / cols)
@@ -531,10 +466,6 @@ local function setup_layout(all_monitors)
     return layout
 end
 
--------------------------------------------------------------------------------
--- Single monitor
--------------------------------------------------------------------------------
-
 local function single_monitor_layout(m)
     m.mon.setTextScale(0.5)
 
@@ -557,12 +488,6 @@ local function single_monitor_layout(m)
         canvas_h = ch * 3,
     }
 end
-
--------------------------------------------------------------------------------
--- RGB framebuffer helpers
---
--- These replace the relevant ccrt_draw framebuffer operations.
--------------------------------------------------------------------------------
 
 local function make_fb(w, h, r, g, b)
     r = r or 0
