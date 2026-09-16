@@ -1,0 +1,1047 @@
+local BASE_URL = "https://music.breakdown-guide.com"
+local CLIENT_NAME = "CCMiniDFPWM"
+local SUBSONIC_VERSION = "1.16.1"
+local MAX_BUFFER = 10
+local THUMB_ROW_OFFSET = 1
+
+-- ============================================================
+-- dependencies
+-- ============================================================
+if not fs.exists("/primeui.lua") then
+    local resp = http.get("https://github.com/INEEDCHATPROGRAAAAAMS/CC-Tweaks-video-player-testing/raw/refs/heads/main/primeui.lua")
+end
+if not fs.exists("/pixelbox_lite.lua") then
+    http.get("https://github.com/9551-Dev/pixelbox_lite/raw/refs/heads/master/pixelbox_lite.lua")
+end
+if not fs.exists("/jpeg_decode.lua") then
+    http.get("https://github.com/INEEDCHATPROGRAAAAAMS/CC-Jpeg/raw/refs/heads/main/jpeg_decode.lua")
+end
+local PrimeUI = require "primeui"
+
+-- ============================================================
+-- USER CONFIGURABLE SETTINGS
+-- ============================================================
+local UI_ROWS = 4
+local MAX_COVER_SIZE = 480
+-- ============================================================
+
+-- URL encode
+local function urlencode(str)
+    if not str then return "" end
+    return (tostring(str):gsub("([^%w%-_.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end))
+end
+
+-- Build auth query
+local function build_auth(u,p)
+    return "&u="..urlencode(u).."&p="..urlencode(p)..
+           "&c="..urlencode(CLIENT_NAME).."&v="..urlencode(SUBSONIC_VERSION)
+end
+
+-- HTTP GET JSON
+local function get_json(url)
+    local ok,res = pcall(http.get,url)
+    if not ok or not res then return nil end
+    local body = res.readAll()
+    res.close()
+    return textutils.unserializeJSON(body)
+end
+
+-- Read login.txt
+local function read_login()
+    if not fs.exists("/login.txt") then error("login.txt not found") end
+    local f = fs.open("/login.txt","r")
+    local user = f.readLine()
+    local pass = f.readLine()
+    f.close()
+    if not user or not pass then error("login.txt invalid") end
+    return user,pass
+end
+
+-- Find speaker
+local function find_speaker()
+    return peripheral.find("speaker") or error("No speaker found")
+end
+
+-- ============================================================
+-- UNIFIED SETTINGS (volume, speed, display mode)
+-- ============================================================
+local function load_settings()
+    local volume = 1.0
+    local speed = 1.0
+    local mode = nil   -- nil means not saved
+    if fs.exists("/musiccache") then
+        local f = fs.open("/musiccache","r")
+        while true do
+            local line = f.readLine()
+            if not line then break end
+            local v = line:match("volume=(.*)")
+            local s = line:match("speed=(.*)")
+            local m = line:match("mode=(.*)")
+            if v then volume = tonumber(v) or volume end
+            if s then speed = tonumber(s) or speed end
+            if m then mode = (m == "monitor") end
+        end
+        f.close()
+    end
+    volume = math.max(0.05, math.min(2.0, volume))
+    speed = math.max(0.25, math.min(3.0, speed))
+    return volume, speed, mode
+end
+
+local function save_settings(volume, speed, use_monitor)
+    local mode_str = use_monitor and "monitor" or "terminal"
+    local f = fs.open("/musiccache","w")
+    f.writeLine("volume="..tostring(volume))
+    f.writeLine("speed="..tostring(speed))
+    f.writeLine("mode="..mode_str)
+    f.close()
+end
+
+-- Shuffle helper
+local function shuffle(t)
+    local copy = {table.unpack(t)}
+    for i=#copy,2,-1 do
+        local j = math.random(i)
+        copy[i], copy[j] = copy[j], copy[i]
+    end
+    return copy
+end
+
+local function send_now_playing(trackId, auth_q)
+    local url = BASE_URL ..
+        "/rest/scrobble.view?id=" ..
+        urlencode(trackId) ..
+        "&time=" .. tostring(os.epoch("utc")) ..
+        "&submission=false" ..
+        auth_q
+    http.get(url)
+end
+
+-- ============================================================
+-- QUANTIZATION (median‑cut)
+-- ============================================================
+
+local function bucket_range(bucket)
+    local rmin,rmax,gmin,gmax,bmin,bmax = 255,0,255,0,255,0
+    for _, p in ipairs(bucket) do
+        if p[1]<rmin then rmin=p[1] end; if p[1]>rmax then rmax=p[1] end
+        if p[2]<gmin then gmin=p[2] end; if p[2]>gmax then gmax=p[2] end
+        if p[3]<bmin then bmin=p[3] end; if p[3]>bmax then bmax=p[3] end
+    end
+    return rmax-rmin, gmax-gmin, bmax-bmin
+end
+
+local function bucket_centroid(bucket)
+    local r,g,b = 0,0,0
+    for _, p in ipairs(bucket) do r=r+p[1]; g=g+p[2]; b=b+p[3] end
+    local n = #bucket
+    return {math.floor(r/n), math.floor(g/n), math.floor(b/n)}
+end
+
+local function split(bucket)
+    local rr,rg,rb = bucket_range(bucket)
+    local axis = (rr>=rg and rr>=rb) and 1 or (rg>=rb and 2 or 3)
+    table.sort(bucket, function(a,b_) return a[axis] < b_[axis] end)
+    local mid = math.floor(#bucket/2)
+    local lo,hi = {},{}
+    for i=1,mid do lo[#lo+1]=bucket[i] end
+    for i=mid+1,#bucket do hi[#hi+1]=bucket[i] end
+    return lo,hi
+end
+
+local function build_palette(rgb_fb, max_samp)
+    max_samp = max_samp or 2000
+    local fb_h = #rgb_fb
+    local fb_w = #rgb_fb[1]
+
+    local samples = {}
+    local step = math.max(1, math.floor(fb_w * fb_h / max_samp))
+    for y = 1, fb_h do
+        for x = 1, fb_w, step do
+            local p = rgb_fb[y][x]
+            if p and (p[1] ~= 0 or p[2] ~= 0 or p[3] ~= 0) then
+                samples[#samples+1] = p
+                if #samples >= max_samp then break end
+            end
+        end
+        if #samples >= max_samp then break end
+    end
+
+    if #samples < 2 then
+        local pal = {}
+        for i = 1, 16 do
+            local v = math.floor((i-1)*255/15)
+            pal[i] = {v,v,v}
+        end
+        return pal
+    end
+
+    local buckets = {samples}
+    while #buckets < 16 do
+        os.sleep(0)
+        local best_i, best_sz = 1, #buckets[1]
+        for i = 2, #buckets do
+            if #buckets[i] > best_sz then best_i,best_sz=i,#buckets[i] end
+        end
+        if best_sz < 2 then break end
+        local lo,hi = split(table.remove(buckets,best_i))
+        buckets[#buckets+1]=lo; buckets[#buckets+1]=hi
+    end
+
+    local result = {}
+    for _, bkt in ipairs(buckets) do
+        if #bkt > 0 then result[#result+1] = bucket_centroid(bkt) end
+    end
+    while #result < 16 do result[#result+1] = {0,0,0} end
+
+    -- Force white (index 1) and black (index 16)
+    result[1]  = {255,255,255}
+    result[16] = {0,0,0}
+    return result
+end
+
+local function nearest_idx(r, g, b, palette)
+    local best_i, best_d = 1, math.huge
+    for i, p in ipairs(palette) do
+        local d = (r-p[1])^2 + (g-p[2])^2 + (b-p[3])^2
+        if d < best_d then best_d = d; best_i = i end
+    end
+    return best_i - 1
+end
+
+local function quantize_to_canvas(rgb_fb, palette, target_w, target_h)
+    local canvas = {}
+    for y = 1, target_h do
+        canvas[y] = {}
+        for x = 1, target_w do
+            local rgb = rgb_fb[y] and rgb_fb[y][x] or {0,0,0}
+            local idx = nearest_idx(rgb[1], rgb[2], rgb[3], palette)
+            canvas[y][x] = 2 ^ idx
+        end
+    end
+    return canvas
+end
+
+-- ============================================================
+-- ALBUM ART WITH PIXELBOX LITE
+-- ============================================================
+local pixelbox, jpeg
+local current_box = nil
+local ui_start_row = 1
+local use_monitor = false
+local monitor_device = nil
+
+-- Helper: get the active display.
+local function get_active_term()
+    return use_monitor and monitor_device or term.current()
+end
+
+local function get_active_periph_name()
+    return use_monitor and peripheral.getName(monitor_device) or nil
+end
+
+local function with_active_term(fn)
+    local old = term.current()
+    local active = get_active_term()
+    term.redirect(active)
+    local ok, a, b, c = pcall(fn, active)
+    term.redirect(old)
+    if not ok then error(a, 0) end
+    return a, b, c
+end
+
+local function fix_text_colors()
+    term.setPaletteColour(colors.white, 1, 1, 1)
+    term.setPaletteColour(colors.black, 0, 0, 0)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+end
+
+local function update_volume_speed(volume, speed)
+    with_active_term(function(active)
+        fix_text_colors()
+        local _, h = active.getSize()
+        local y = math.max(1, h - UI_ROWS + 2)
+        term.setCursorPos(1, y)
+        term.clearLine()
+        write(("W/S:Vol %.2f Z/C:Spd %.2fx"):format(volume, speed))
+    end)
+end
+
+local function update_now_playing(track)
+    with_active_term(function(active)
+        fix_text_colors()
+        local term_w, term_h = active.getSize()
+        local artist = track.artist or "Unknown Artist"
+        local title = track.title or "Unknown Title"
+        local now_playing = "Now: " .. artist .. " - " .. title
+        if #now_playing > term_w then
+            now_playing = now_playing:sub(1, math.max(1, term_w - 3)) .. "..."
+        end
+        term.setCursorPos(1, term_h - 1)
+        term.clearLine()
+        write(now_playing)
+    end)
+end
+
+local function draw_full_ui(track, volume, speed)
+    with_active_term(function(active)
+        fix_text_colors()
+        local term_w, term_h = active.getSize()
+        ui_start_row = math.max(1, term_h - UI_ROWS + 1)
+
+        for row = ui_start_row, term_h do
+            term.setCursorPos(1, row)
+            term.clearLine()
+        end
+
+        term.setCursorPos(1, ui_start_row)
+        print("A/D:Skip   Space:Pause")
+
+        term.setCursorPos(1, ui_start_row + 1)
+        print(("W/S:Vol %.2f Z/C:Spd %.2fx"):format(volume, speed))
+
+        local artist = track.artist or "Unknown Artist"
+        local title = track.title or "Unknown Title"
+        local now_playing = "Now: " .. artist .. " - " .. title
+        if #now_playing > term_w then
+            now_playing = now_playing:sub(1, math.max(1, term_w - 3)) .. "..."
+        end
+
+        term.setCursorPos(1, ui_start_row + 2)
+        print(now_playing)
+    end)
+end
+
+-- PrimeUI-backed playback controls. PrimeUI handles mouse_click for an
+-- internal touchscreen terminal and monitor_touch for an external monitor.
+local playback_ui_generation = 0
+
+local function draw_touch_buttons(track, input_state)
+    local active = get_active_term()
+    local periph = get_active_periph_name()
+
+    local old = term.current()
+    term.redirect(active)
+    -- PrimeUI.clear() is deliberately done by play_track_buffered() before
+    -- the album art is rendered. Do not clear here, or the artwork disappears.
+    fix_text_colors()
+
+    local w, h = active.getSize()
+    local y = h
+
+    local function action(fn)
+        return function()
+            if input_state.cancelled then return end
+            fn()
+        end
+    end
+
+    local function btn(x, label, fn)
+        if x + #label + 1 <= w then
+            PrimeUI.button(active, x, y, label, action(fn), colors.white, colors.gray, colors.lightGray, periph)
+        end
+    end
+
+    -- Queue navigation: previous track only.
+    btn(1, "<<", function() input_state.skip_back = true end)
+    btn(5, input_state.paused and "Play" or "Pause", function()
+        input_state.paused = not input_state.paused
+    end)
+    btn(17, ">>", function() input_state.skip_forward = true end)
+    btn(21, "Vol+", function()
+        input_state.volume = math.min(2.0, input_state.volume + 0.05)
+        save_settings(input_state.volume, input_state.speed, use_monitor)
+        update_volume_speed(input_state.volume, input_state.speed)
+    end)
+    btn(27, "Vol-", function()
+        input_state.volume = math.max(0.05, input_state.volume - 0.05)
+        save_settings(input_state.volume, input_state.speed, use_monitor)
+        update_volume_speed(input_state.volume, input_state.speed)
+    end)
+    btn(33, "Spd+", function()
+        input_state.speed = math.min(3.0, input_state.speed + 0.01)
+        save_settings(input_state.volume, input_state.speed, use_monitor)
+        update_volume_speed(input_state.volume, input_state.speed)
+    end)
+    btn(39, "Spd-", function()
+        input_state.speed = math.max(0.25, input_state.speed - 0.01)
+        save_settings(input_state.volume, input_state.speed, use_monitor)
+        update_volume_speed(input_state.volume, input_state.speed)
+    end)
+    -- Navigation: leave playback and return to track selection.
+    btn(45, "Back", function() input_state.back = true end)
+
+    PrimeUI.keyAction(keys.a, action(function() input_state.skip_back = true end))
+    PrimeUI.keyAction(keys.d, action(function() input_state.skip_forward = true end))
+    PrimeUI.keyAction(keys.space, action(function() input_state.paused = not input_state.paused end))
+    PrimeUI.keyAction(keys.w, action(function()
+        input_state.volume = math.min(2.0, input_state.volume + 0.05)
+        save_settings(input_state.volume, input_state.speed, use_monitor)
+        update_volume_speed(input_state.volume, input_state.speed)
+    end))
+    PrimeUI.keyAction(keys.s, action(function()
+        input_state.volume = math.max(0.05, input_state.volume - 0.05)
+        save_settings(input_state.volume, input_state.speed, use_monitor)
+        update_volume_speed(input_state.volume, input_state.speed)
+    end))
+    PrimeUI.keyAction(keys.c, action(function()
+        input_state.speed = math.min(3.0, input_state.speed + 0.01)
+        save_settings(input_state.volume, input_state.speed, use_monitor)
+        update_volume_speed(input_state.volume, input_state.speed)
+    end))
+    PrimeUI.keyAction(keys.z, action(function()
+        input_state.speed = math.max(0.25, input_state.speed - 0.01)
+        save_settings(input_state.volume, input_state.speed, use_monitor)
+        update_volume_speed(input_state.volume, input_state.speed)
+    end))
+    PrimeUI.keyAction(keys.q, action(function() input_state.back = true end))
+
+    term.redirect(old)
+end
+
+local function get_cover_art_size(term_w, term_h)
+    local image_rows = math.max(0, term_h - UI_ROWS - THUMB_ROW_OFFSET)
+    if image_rows <= 0 then return 64 end
+    local top_pixel_w = term_w * 2
+    local top_pixel_h = image_rows * 3
+    local needed = math.min(top_pixel_w, top_pixel_h)
+    return math.min(needed, MAX_COVER_SIZE)
+end
+
+local function update_album_art(track, auth_q)
+    local active = get_active_term()
+    local term_w, term_h = active.getSize()
+    local image_rows = math.max(0, term_h - UI_ROWS)
+    if image_rows <= 0 then
+        if current_box then current_box:clear(colors.black); current_box:render() end
+        fix_text_colors()
+        return
+    end
+    local top_pixel_h = image_rows * 3
+    local canvas_w = term_w * 2
+    local canvas_h = term_h * 3
+
+    local display = use_monitor and monitor_device or active
+    if not current_box or current_box.term ~= display then
+        current_box = pixelbox.new(display, colors.black)
+    end
+    if current_box.width ~= canvas_w or current_box.height ~= canvas_h then
+        current_box:resize(canvas_w, canvas_h, colors.black)
+    end
+
+    local cover_id = track.coverArt
+    if not cover_id or cover_id == "" then
+        current_box:clear(colors.black)
+        current_box:render()
+        fix_text_colors()
+        return
+    end
+
+    local req_size = get_cover_art_size(term_w, term_h)
+    local url = BASE_URL .. "/rest/getCoverArt.view?id=" .. urlencode(cover_id) .. "&size=" .. req_size .. auth_q
+    local resp, err = http.get(url, {binary=true})
+    if not resp then
+        current_box:clear(colors.black)
+        current_box:render()
+        fix_text_colors()
+        return
+    end
+    local img_data = resp.readAll()
+    resp.close()
+
+    local ok, src_fb, w, h = pcall(jpeg.decode, img_data)
+    if not ok or not src_fb then
+        current_box:clear(colors.black)
+        current_box:render()
+        fix_text_colors()
+        return
+    end
+
+    local scale = math.min(canvas_w / w, top_pixel_h / h)
+    local sw = math.max(1, math.floor(w * scale))
+    local sh = math.max(1, math.floor(h * scale))
+    local scaled_rgb = jpeg.scale_fb(src_fb, w, h, sw, sh)
+
+    local palette = build_palette(scaled_rgb, 2000)
+    for i = 1, 16 do
+        local col = palette[i]
+        term.setPaletteColour(2^(i-1), col[1]/255, col[2]/255, col[3]/255)
+    end
+
+    local top_canvas = quantize_to_canvas(scaled_rgb, palette, sw, sh)
+    local ox = math.floor((canvas_w - sw) / 2) + 1
+    local oy = math.floor((top_pixel_h - sh) / 2) + 1
+
+    current_box:clear(colors.black)
+    for y = 1, sh do
+        local row = top_canvas[y]
+        for x = 1, sw do
+            current_box.canvas[oy + y - 1][ox + x - 1] = row[x]
+        end
+    end
+
+    current_box:render()
+    fix_text_colors()
+end
+
+-- ============================================================
+-- AUDIO PLAYBACK
+-- ============================================================
+local function resample_pcm(pcm, speed)
+    if speed == 1.0 then return pcm end
+    local out = {}
+    local len = #pcm
+    local pos = 1
+    while pos <= len do
+        out[#out+1] = pcm[math.floor(pos)]
+        pos = pos + speed
+    end
+    return out
+end
+
+local function play_track_buffered(tr, auth_q, speaker, input_state, volume, speed)
+    -- Clear first, then render album art, then text, then PrimeUI controls.
+    PrimeUI.clear()
+    update_album_art(tr, auth_q)
+    os.sleep(0.05)
+
+    input_state.volume = volume
+    input_state.speed = speed
+    input_state.paused = false
+    input_state.skip_forward = false
+    input_state.skip_back = false
+    input_state.back = false
+    input_state.cancelled = false
+
+    draw_full_ui(tr, volume, speed)
+    draw_touch_buttons(tr, input_state)
+
+    local url = BASE_URL.."/rest/stream.view?id="..urlencode(tr.id).."&format=dfpwm"..auth_q
+    local resp = http.get(url, {binary=true})
+    if not resp then return false end
+
+    local decoder = require("cc.audio.dfpwm").make_decoder()
+    local pcmBuffer = {}
+    local streaming_done = false
+    local stop = false
+    local next_ping = os.clock() + 10
+
+    send_now_playing(tr.id, auth_q)
+
+    local function fill_buffer()
+        while not stop and #pcmBuffer < MAX_BUFFER do
+            local chunk = resp.read(2048)
+            if not chunk then
+                streaming_done = true
+                break
+            end
+            local pcm = decoder(chunk)
+            if #pcm > 0 then table.insert(pcmBuffer, pcm) end
+        end
+    end
+
+    local function input_loop()
+        -- PrimeUI owns the input event loop. Audio runs in a separate
+        -- coroutine via parallel.waitForAny().
+        local action
+        while not stop do
+            action = PrimeUI.run()
+            if action then
+                -- PrimeUI.run returns only when a UI action calls resolve().
+                -- All normal button/key actions mutate input_state directly.
+                stop = input_state.skip_forward or input_state.skip_back or input_state.back
+            end
+        end
+    end
+
+    local function audio_loop()
+        fill_buffer()
+
+        while not stop and (not streaming_done or #pcmBuffer > 0) do
+            if next_ping and os.clock() >= next_ping then
+                pcall(send_now_playing, tr.id, auth_q)
+                next_ping = os.clock() + 10
+            end
+
+            if input_state.back or input_state.skip_forward or input_state.skip_back then
+                stop = true
+                break
+            end
+
+            if not streaming_done and #pcmBuffer < MAX_BUFFER then
+                fill_buffer()
+            end
+
+            if not input_state.paused and #pcmBuffer > 0 then
+                local chunk = table.remove(pcmBuffer, 1)
+                local adj = resample_pcm(chunk, input_state.speed)
+                if not speaker.playAudio(adj, input_state.volume) then
+                    table.insert(pcmBuffer, 1, chunk)
+                    os.sleep(0.01)
+                end
+            else
+                os.sleep(0.01)
+            end
+        end
+        stop = true
+    end
+
+    -- PrimeUI and audio execute concurrently. Input never has to wait for
+    -- an audio buffer operation to finish.
+    parallel.waitForAny(audio_loop, input_loop)
+
+    input_state.cancelled = true
+    resp.close()
+
+    -- Return the navigation action separately from skip_back.
+    -- "Back" leaves playback and returns to the track selection UI,
+    -- while "<<" only changes the queue position.
+    local action = nil
+    if input_state.back then
+        action = "back"
+    elseif input_state.skip_forward then
+        action = "skip_forward"
+    elseif input_state.skip_back then
+        action = "skip_back"
+    end
+
+    return input_state.volume, input_state.speed, action
+end
+
+local function run_play_queue(tracks, auth_q, start_track)
+    local queue = {start_track}
+    local rest = {}
+    -- Load initial volume, speed (mode is global, not used here)
+    local volume, speed = load_settings() -- we ignore the mode return
+    local input_state = {skip_forward=false, skip_back=false, paused=false}
+    for _, t in ipairs(tracks) do
+        if t.id ~= start_track.id then table.insert(rest, t) end
+    end
+    rest = shuffle(rest)
+    for _, t in ipairs(rest) do table.insert(queue, t) end
+
+    local speaker = find_speaker()
+    local idx = 1
+
+    while true do
+        local tr = queue[idx]
+        input_state.paused = false
+        local newVol, newSpeed, action = play_track_buffered(tr, auth_q, speaker, input_state, volume, speed)
+        if action == "back" then
+            return
+        end
+        volume = newVol or volume
+        speed = newSpeed or speed
+
+        if idx < #queue then
+            update_now_playing(queue[idx + 1])
+        else
+            update_now_playing(queue[1])
+        end
+
+        if input_state.skip_forward then
+            idx = idx + 1
+            if idx > #queue then idx = 1 end
+        elseif input_state.skip_back then
+            idx = idx - 1
+            if idx < 1 then idx = #queue end
+        else
+            idx = idx + 1
+            if idx > #queue then idx = 1 end
+        end
+        input_state.skip_forward = false
+        input_state.skip_back = false
+    end
+end
+
+-- ============================================================
+-- PLAYLIST / TRACK SELECTION (PrimeUI)
+-- ============================================================
+
+local function prepare_primeui_screen()
+    local active = get_active_term()
+    local old = term.current()
+    term.redirect(active)
+    PrimeUI.clear()
+    fix_text_colors()
+    return active, old
+end
+
+local function finish_primeui_screen(old)
+    term.redirect(old)
+end
+
+local function primeui_text_task(handler)
+    PrimeUI.addTask(function()
+        while true do
+            local ev = table.pack(os.pullEvent())
+            handler(table.unpack(ev, 1, ev.n))
+        end
+    end)
+end
+
+local function add_common_navigation(display, periph, y, back_action)
+    if y <= 0 then return end
+    PrimeUI.button(display, 1, y, "Back", back_action, colors.white, colors.gray, colors.lightGray, periph)
+end
+
+local function pick_playlist(playlists)
+    local active, old = prepare_primeui_screen()
+    local periph = get_active_periph_name()
+    local w, h = active.getSize()
+    local page_size = math.max(1, h - 4)
+    local page = 1
+    local max_page = math.max(1, math.ceil(#playlists / page_size))
+
+    while true do
+        PrimeUI.clear()
+        fix_text_colors()
+        PrimeUI.label(active, 1, 1, "Select a playlist")
+        PrimeUI.label(active, 1, 2, ("Page %d/%d"):format(page, max_page))
+
+        local mode_x = math.max(1, w - 18)
+        PrimeUI.button(active, mode_x, 1, use_monitor and "Terminal" or "Monitor", function()
+            PrimeUI.resolve("switch_mode")
+        end, colors.white, colors.gray, colors.lightGray, periph)
+
+        local start_idx = (page - 1) * page_size + 1
+        local end_idx = math.min(#playlists, start_idx + page_size - 1)
+
+        for i = start_idx, end_idx do
+            local row = 2 + (i - start_idx) + 1
+            local p = playlists[i]
+            local text = ("%d) %s (%d tracks)"):format(i, p.name or "?", p.songCount or 0)
+            if #text > w - 2 then text = text:sub(1, math.max(1, w - 5)) .. "..." end
+            PrimeUI.button(active, 1, row, text, function()
+                PrimeUI.resolve("select", p)
+            end, colors.white, colors.gray, colors.lightGray, periph)
+        end
+
+        local bottom = h
+        if page > 1 then
+            PrimeUI.button(active, 1, bottom, "Prev", function()
+                page = page - 1
+                PrimeUI.resolve("redraw")
+            end, colors.white, colors.gray, colors.lightGray, periph)
+        end
+        if page < max_page then
+            local x = page > 1 and 9 or 1
+            PrimeUI.button(active, x, bottom, "Next", function()
+                page = page + 1
+                PrimeUI.resolve("redraw")
+            end, colors.white, colors.gray, colors.lightGray, periph)
+        end
+        PrimeUI.button(active, math.max(1, w - 9), bottom, "Quit", function()
+            PrimeUI.resolve("quit")
+        end, colors.white, colors.gray, colors.lightGray, periph)
+
+        PrimeUI.keyAction(keys.q, function() PrimeUI.resolve("quit") end)
+        PrimeUI.keyAction(keys.b, function() PrimeUI.resolve("back") end)
+        PrimeUI.keyAction(keys.m, function() PrimeUI.resolve("switch_mode") end)
+        if page > 1 then PrimeUI.keyAction(keys.left, function() page = page - 1; PrimeUI.resolve("redraw") end) end
+        if page < max_page then PrimeUI.keyAction(keys.right, function() page = page + 1; PrimeUI.resolve("redraw") end) end
+
+        -- Numeric keyboard selection, in addition to touch.
+        primeui_text_task(function(event, ch)
+            if event == "char" then
+                local n = tonumber(ch)
+                if n then
+                    local idx = start_idx + n - 1
+                    if idx <= end_idx then PrimeUI.resolve("select", playlists[idx]) end
+                end
+            end
+        end)
+
+        local action, value = PrimeUI.run()
+        if action == "select" then
+            finish_primeui_screen(old)
+            return value
+        elseif action == "switch_mode" then
+            finish_primeui_screen(old)
+            return "SWITCH_MODE"
+        elseif action == "redraw" then
+            -- Rebuild the PrimeUI component tasks for the new page.
+        elseif action == "quit" then
+            finish_primeui_screen(old)
+            return "EXIT"
+        elseif action == "back" then
+            finish_primeui_screen(old)
+            return nil
+        end
+    end
+end
+
+local function pick_track_paged(tracks)
+    local active, old = prepare_primeui_screen()
+    local periph = get_active_periph_name()
+    local w, h = active.getSize()
+    local page_size = math.max(1, h - 5)
+    local page = 1
+    local max_page = math.max(1, math.ceil(#tracks / page_size))
+
+    while true do
+        PrimeUI.clear()
+        fix_text_colors()
+        PrimeUI.label(active, 1, 1, "Select a track")
+        PrimeUI.label(active, 1, 2, ("Page %d/%d"):format(page, max_page))
+
+        local mode_x = math.max(1, w - 18)
+        PrimeUI.button(active, mode_x, 1, use_monitor and "Terminal" or "Monitor", function()
+            PrimeUI.resolve("switch_mode")
+        end, colors.white, colors.gray, colors.lightGray, periph)
+
+        local start_idx = (page - 1) * page_size + 1
+        local end_idx = math.min(#tracks, start_idx + page_size - 1)
+
+        for i = start_idx, end_idx do
+            local row = 2 + (i - start_idx) + 1
+            local artist = tracks[i].artist or "?"
+            local title = tracks[i].title or "?"
+            local text = ("%d) %s - %s"):format(i, artist, title)
+            if #text > w - 2 then text = text:sub(1, math.max(1, w - 5)) .. "..." end
+            PrimeUI.button(active, 1, row, text, function()
+                PrimeUI.resolve("select", tracks[i])
+            end, colors.white, colors.gray, colors.lightGray, periph)
+        end
+
+        local bottom = h
+        local x = 1
+        if page > 1 then
+            PrimeUI.button(active, x, bottom, "Prev", function()
+                page = page - 1
+                PrimeUI.resolve("redraw")
+            end, colors.white, colors.gray, colors.lightGray, periph)
+            x = x + 9
+        end
+        if page < max_page then
+            PrimeUI.button(active, x, bottom, "Next", function()
+                page = page + 1
+                PrimeUI.resolve("redraw")
+            end, colors.white, colors.gray, colors.lightGray, periph)
+            x = x + 9
+        end
+        PrimeUI.button(active, x, bottom, "Play", function()
+            PrimeUI.resolve("play", tracks[start_idx])
+        end, colors.white, colors.gray, colors.lightGray, periph)
+        PrimeUI.button(active, math.max(1, w - 9), bottom, "Back", function()
+            PrimeUI.resolve("back")
+        end, colors.white, colors.gray, colors.lightGray, periph)
+
+        PrimeUI.keyAction(keys.q, function() PrimeUI.resolve("back") end)
+        PrimeUI.keyAction(keys.b, function() PrimeUI.resolve("back") end)
+        PrimeUI.keyAction(keys.m, function() PrimeUI.resolve("switch_mode") end)
+        PrimeUI.keyAction(keys.left, function()
+            if page > 1 then page = page - 1; PrimeUI.resolve("redraw") end
+        end)
+        PrimeUI.keyAction(keys.right, function()
+            if page < max_page then page = page + 1; PrimeUI.resolve("redraw") end
+        end)
+
+        primeui_text_task(function(event, ch)
+            if event == "char" then
+                local n = tonumber(ch)
+                if n then
+                    local idx = start_idx + n - 1
+                    if idx <= end_idx then PrimeUI.resolve("select", tracks[idx]) end
+                end
+            end
+        end)
+
+        local action, value = PrimeUI.run()
+        if action == "select" then
+            finish_primeui_screen(old)
+            return value
+        elseif action == "play" then
+            finish_primeui_screen(old)
+            return value
+        elseif action == "switch_mode" then
+            finish_primeui_screen(old)
+            return "SWITCH_MODE"
+        elseif action == "redraw" then
+            -- Rebuild the PrimeUI component tasks for the new page.
+        elseif action == "back" then
+            finish_primeui_screen(old)
+            return "BACK_TO_PLAYLISTS"
+        end
+    end
+end
+
+-- ============================================================
+-- LOGIN
+-- ============================================================
+local function interactive_login()
+    while true do
+        term.clear()
+        term.setCursorPos(1,1)
+        print("Login Required")
+        io.write("Username: ")
+        local user = io.read()
+        io.write("Password: ")
+        local pass = io.read()
+        local auth_q = build_auth(user, pass)
+        local test = get_json(BASE_URL.."/rest/ping.view?f=json"..auth_q)
+        if test and test["subsonic-response"] and test["subsonic-response"].status == "ok" then
+            local f = fs.open("/login.txt","w")
+            f.writeLine(user)
+            f.writeLine(pass)
+            f.close()
+            print("Login successful! Saved to login.txt")
+            sleep(1)
+            return user, pass
+        else
+            print("Login failed! Check username/password.")
+            print("Press Enter to retry...")
+            io.read()
+        end
+    end
+end
+
+-- ============================================================
+-- MAIN PROGRAM LOOP (handles mode switching and back navigation)
+-- ============================================================
+math.randomseed(os.time()+os.clock())
+print("CC:SUBSONIC")
+
+-- Load libraries
+if not pcall(require, "pixelbox_lite") then shell.run("wget https://raw.githubusercontent.com/9551-Dev/pixelbox_lite/master/pixelbox_lite.lua") end
+if not pcall(require, "jpeg_decode") then shell.run("wget https://github.com/INEEDCHATPROGRAAAAAMS/CC-Tweaks-video-player-testing/raw/refs/heads/main/jpeg_decode.lua") end
+pixelbox = require("pixelbox_lite")
+jpeg = require("jpeg_decode")
+
+-- Monitor detection and mode selection (unified with saved settings)
+print("Scanning for peripherals...")
+local found_monitor = false
+for _, side in ipairs(peripheral.getNames()) do
+    local ptype = peripheral.getType(side)
+    print(" - " .. side .. " : " .. ptype)
+    if ptype == "monitor" then
+        monitor_device = peripheral.wrap(side)
+        -- CC:Tweaked monitors support scales from 0.5 upward.
+        -- Use the smallest scale so the monitor has the maximum UI space.
+        monitor_device.setTextScale(0.5)
+        found_monitor = true
+        print("Monitor found on side: " .. side .. " (text scale 0.5)")
+    end
+end
+
+-- Load saved settings (volume, speed, and mode)
+local saved_vol, saved_spd, saved_mode = load_settings()
+use_monitor = (saved_mode == true)  -- if nil, use_monitor will be false
+
+if found_monitor then
+    if saved_mode == nil then
+        -- First run: use PrimeUI so an internal touchscreen can choose the
+        -- display mode too. Keyboard input remains available.
+        local active = term.current()
+        term.redirect(active)
+        PrimeUI.clear()
+        fix_text_colors()
+        local w, h = active.getSize()
+        PrimeUI.label(active, 1, 1, "CC:SUBSONIC")
+        PrimeUI.label(active, 1, 3, "Choose display:")
+        PrimeUI.button(active, 1, 5, "Terminal", function()
+            PrimeUI.resolve("mode", false)
+        end)
+        PrimeUI.button(active, 13, 5, "Monitor", function()
+            PrimeUI.resolve("mode", true)
+        end)
+        PrimeUI.label(active, 1, h, "Default: Terminal after 3 seconds")
+        PrimeUI.keyAction(keys.t, function() PrimeUI.resolve("mode", false) end)
+        PrimeUI.keyAction(keys.m, function() PrimeUI.resolve("mode", true) end)
+        PrimeUI.timeout(3, function() PrimeUI.resolve("mode", false) end)
+        local _, selected = PrimeUI.run()
+        use_monitor = selected == true
+        save_settings(saved_vol, saved_spd, use_monitor)
+    else
+        print("Using saved display mode: " .. (use_monitor and "monitor" or "terminal"))
+        -- Ensure volume/speed are saved with correct mode (they already are)
+        -- but we might need to apply them later.
+    end
+else
+    print("No monitor found. Running in terminal-only mode.")
+    use_monitor = false
+    monitor_device = nil
+end
+
+-- Login (input comes from the currently active terminal)
+local user, pass
+if fs.exists("/login.txt") then
+    user, pass = read_login()
+else
+    user, pass = interactive_login()
+end
+local auth_q = build_auth(user, pass)
+
+-- Redirect to monitor at startup if needed
+if use_monitor and monitor_device then
+    monitor_device.setTextScale(0.5)
+    term.redirect(monitor_device)
+    term.clear()
+    fix_text_colors()
+end
+
+-- Main outer loop: playlist selection -> track picker -> playback, with ability to go back
+::restart_outer::
+while true do
+    -- Fetch playlists
+    local pls_json = get_json(BASE_URL.."/rest/getPlaylists.view?f=json"..auth_q)
+    local playlists = pls_json and pls_json["subsonic-response"] and pls_json["subsonic-response"].playlists and pls_json["subsonic-response"].playlists.playlist
+    if not playlists or #playlists == 0 then
+        print("No playlists found")
+        break
+    end
+
+    -- Playlist selection (touch or terminal)
+    local selected_playlist
+    selected_playlist = pick_playlist(playlists)
+    if selected_playlist == "SWITCH_MODE" then
+        use_monitor = monitor_device ~= nil and not use_monitor
+        local cur_vol, cur_spd = load_settings()
+        save_settings(cur_vol, cur_spd, use_monitor)
+        goto restart_outer
+    elseif selected_playlist == "EXIT" then
+        print("Exiting program.")
+        return
+    elseif not selected_playlist then
+        break
+    end
+
+    -- Fetch tracks for selected playlist
+    local tracks_json = get_json(BASE_URL.."/rest/getPlaylist.view?id="..urlencode(selected_playlist.id).."&f=json"..auth_q)
+    local tracks = tracks_json and tracks_json["subsonic-response"] and tracks_json["subsonic-response"].playlist and tracks_json["subsonic-response"].playlist.entry
+    if not tracks or #tracks == 0 then
+        print("No tracks found in this playlist")
+        sleep(1)
+        goto continue
+    end
+
+    -- Track picker loop (may return track, mode switch, or back to playlists)
+    while true do
+        local chosen
+        chosen = pick_track_paged(tracks)
+
+        if chosen == "SWITCH_MODE" then
+            use_monitor = monitor_device ~= nil and not use_monitor
+            local cur_vol, cur_spd = load_settings()
+            save_settings(cur_vol, cur_spd, use_monitor)
+            goto restart_outer
+        elseif chosen == "BACK_TO_PLAYLISTS" then
+            break
+        elseif chosen ~= nil then
+            -- Start playback
+            if use_monitor and monitor_device then
+                term.redirect(monitor_device)
+                term.clear()
+            end
+            run_play_queue(tracks, auth_q, chosen)
+            break
+        else
+            break
+        end
+    end
+
+    ::continue::
+end
