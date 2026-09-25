@@ -12,9 +12,7 @@ local MAX_COVER_SIZE = 480
 
 
 if not fs.exists("/ccsubsonic")     then fs.makeDir("/ccsubsonic") end
-if not fs.exists("/ccsubsonic/lib") then fs.makeDir("/ccsubsonic/lib") end
-
-local LIB_DIR = "/ccsubsonic/lib"
+local LIB_DIR = "/ccsubsonic/"
 
 package.path = LIB_DIR .. "/?.lua;" .. package.path
 
