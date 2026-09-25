@@ -21,15 +21,9 @@
 
 local M = {}
 
--------------------------------------------------------------------------------
--- Precomputed tables
--------------------------------------------------------------------------------
-
--- Powers of 2: pow2[n] = 2^n  (n = 0..32, all exact as Lua doubles)
 local pow2 = {}
 for i = 0, 32 do pow2[i] = 2 ^ i end
 
--- Cosine table for IDCT: COS[u][x] = cos((2x+1)*u*π/16), u,x = 0..7
 local COS = (function()
     local t   = {}
     local pi16 = math.pi / 16
@@ -40,10 +34,8 @@ local COS = (function()
     return t
 end)()
 
-local ISQRT2 = 1 / math.sqrt(2)   -- 1/√2  (C₀ scaling factor)
+local ISQRT2 = 1 / math.sqrt(2)
 
--- UNZIGZAG[i] maps zigzag position i (1-indexed) to row-major position
--- (1-indexed) within an 8×8 block.
 local UNZIGZAG = {
      1,  2,  9, 17, 10,  3,  4, 11,
     18, 25, 33, 26, 19, 12,  5,  6,
@@ -55,9 +47,6 @@ local UNZIGZAG = {
     54, 61, 62, 55, 48, 56, 63, 64,
 }
 
--------------------------------------------------------------------------------
--- Byte reader  (marker-level parsing)
--------------------------------------------------------------------------------
 
 local function make_byte_reader(data)
     local pos = 1
@@ -70,7 +59,7 @@ local function make_byte_reader(data)
         return b
     end
 
-    local function u16()   -- big-endian unsigned 16-bit
+    local function u16()
         local hi = data:byte(pos)
         local lo = data:byte(pos + 1)
         pos = pos + 2
@@ -85,25 +74,12 @@ local function make_byte_reader(data)
     }
 end
 
--------------------------------------------------------------------------------
--- Bit reader  (compressed scan data)
---
--- Invariant: `buf` holds exactly `bits` valid bits in its lowest positions.
--- New bytes are shifted into the high end of `buf` during fill().
--- Reading extracts from the high end.
--------------------------------------------------------------------------------
-
 local function make_bit_reader(data, start_pos)
     local pos  = start_pos
     local dlen = #data
-    local buf  = 0       -- bit accumulator
-    local bits = 0       -- number of valid bits currently in buf
-    local rst  = false   -- true if an RST marker was just crossed
-
-    -- Refill buf to at least 16 bits.  Handles:
-    --   0xFF 0x00  →  literal 0xFF byte  (byte stuffing)
-    --   0xFF 0xD0-0xD7  →  RST marker  (set flag, stop filling)
-    --   0xFF 0xD9       →  EOI         (stop filling)
+    local buf  = 0       
+    local bits = 0       
+    local rst  = false   
     local function fill()
         while bits < 16 do
             if pos > dlen then break end
@@ -113,13 +89,13 @@ local function make_bit_reader(data, start_pos)
             if b == 0xFF then
                 local b2 = data:byte(pos)
                 if b2 == 0x00 then
-                    pos = pos + 1           -- stuffed 0xFF → keep 0xFF
+                    pos = pos + 1           
                 elseif b2 and b2 >= 0xD0 and b2 <= 0xD7 then
-                    pos = pos + 1           -- RST marker: skip, set flag, stop
+                    pos = pos + 1          
                     rst = true
                     break
                 else
-                    break                   -- EOI or other marker: stop
+                    break                   
                 end
             end
 
@@ -153,13 +129,6 @@ local function make_bit_reader(data, start_pos)
         end,
     }
 end
-
--------------------------------------------------------------------------------
--- Canonical Huffman decoder builder
---
--- counts[i] = number of codes of bit-length i  (i = 1..16)
--- syms      = flat array of symbol values in canonical order
--------------------------------------------------------------------------------
 
 local function make_huffman(counts, syms)
     local mincode = {}   -- mincode[i] = smallest code value for length i
@@ -197,25 +166,12 @@ local function make_huffman(counts, syms)
     end
 end
 
--------------------------------------------------------------------------------
--- JPEG EXTEND procedure: sign-extend a raw value of category t
--- (JPEG standard §F.2.2.1)
--------------------------------------------------------------------------------
-
 local function extend(v, t)
     if t == 0 then return 0 end
     if v < pow2[t - 1] then return v - pow2[t] + 1 end
     return v
 end
 
--------------------------------------------------------------------------------
--- 2-D IDCT  (exact separable 8-point IDCT, applied row-then-column)
---
--- Input:  blk – 64-element array, row-major, 1-indexed, dequantised coefficients
--- Output: 64-element array, 1-indexed, level-shifted pixel values clamped [0,255]
---
--- The JPEG level shift (add 128) is applied during the final column pass.
--------------------------------------------------------------------------------
 
 local function idct2d(blk)
     -- 1-D IDCT kernel.
@@ -255,11 +211,6 @@ local function idct2d(blk)
     return out
 end
 
--------------------------------------------------------------------------------
--- Core decode: takes a raw JPEG byte string, returns (fb, width, height)
--- where fb[y][x] = {r, g, b}  (1-indexed, values 0-255)
--------------------------------------------------------------------------------
-
 function M.decode(data)
     local br = make_byte_reader(data)
 
@@ -275,9 +226,6 @@ function M.decode(data)
     local img_w, img_h, ncomp
     local restart_interval = 0
 
-    --------------------------------------------------------------------------
-    -- Marker scanning helper: skip garbage, return next marker byte
-    --------------------------------------------------------------------------
     local function next_marker()
         local b = br.u8()
         -- Sync to first 0xFF (skip any non-marker garbage)
@@ -287,18 +235,11 @@ function M.decode(data)
         return b   -- the actual marker type byte (without leading 0xFF)
     end
 
-    --------------------------------------------------------------------------
-    -- Marker loop
-    --------------------------------------------------------------------------
     while true do
         local m = next_marker()
         if not m then break end
-
-        -- ── EOI ──────────────────────────────────────────────────────────
         if m == 0xD9 then
             break
-
-        -- ── SOS (Start Of Scan) ───────────────────────────────────────────
         -- Parse the header, then break out to the scan decoder below.
         elseif m == 0xDA then
             local _len = br.u16()
@@ -313,7 +254,6 @@ function M.decode(data)
             br.skip(3)   -- Ss, Se, Ah/Al  (baseline: 0x00, 0x3F, 0x00)
             break         -- compressed data begins immediately here
 
-        -- ── DQT (Define Quantisation Table) ──────────────────────────────
         elseif m == 0xDB then
             local len  = br.u16()
             local done = 2
@@ -332,7 +272,6 @@ function M.decode(data)
                 qtables[id] = qt
             end
 
-        -- ── SOF0 (Start Of Frame, Baseline DCT) ──────────────────────────
         elseif m == 0xC0 then
             local _len  = br.u16()
             local _prec = br.u8()       -- sample precision (almost always 8)
@@ -353,7 +292,6 @@ function M.decode(data)
                 }
             end
 
-        -- ── DHT (Define Huffman Table) ────────────────────────────────────
         elseif m == 0xC4 then
             local len  = br.u16()
             local done = 2
@@ -375,17 +313,13 @@ function M.decode(data)
                 if tc == 0 then huffdc[th] = huff
                 else             huffac[th] = huff end
             end
-
-        -- ── DRI (Define Restart Interval) ─────────────────────────────────
         elseif m == 0xDD then
             br.u16()                       -- length (always 4)
             restart_interval = br.u16()
 
-        -- ── RST markers at top level (shouldn't happen, ignore) ───────────
+        -- ── RST markers at top level (shouldn't happen, ignore)
         elseif m >= 0xD0 and m <= 0xD7 then
             -- nothing
-
-        -- ── Everything else: skip over the segment ────────────────────────
         else
             local len = br.u16()
             br.skip(len - 2)
@@ -394,9 +328,6 @@ function M.decode(data)
 
     assert(img_w and img_h and ncomp, "[jpeg] SOF0 not found before SOS")
 
-    --------------------------------------------------------------------------
-    -- Build ordered component list and compute MCU geometry
-    --------------------------------------------------------------------------
 
     -- Components are almost always identified as 1, 2, 3 (Y, Cb, Cr).
     -- Fall back to whatever we have if IDs are non-standard.
@@ -424,9 +355,6 @@ function M.decode(data)
     local mcus_x = math.ceil(img_w / mcu_w)
     local mcus_y = math.ceil(img_h / mcu_h)
 
-    --------------------------------------------------------------------------
-    -- Allocate component planes (each at its own, possibly subsampled, size)
-    --------------------------------------------------------------------------
 
     local planes = {}
     for ci, c in ipairs(comp_list) do
@@ -441,9 +369,6 @@ function M.decode(data)
         planes[ci] = { rows = rows }
     end
 
-    --------------------------------------------------------------------------
-    -- Decode compressed scan data
-    --------------------------------------------------------------------------
 
     local sbr   = make_bit_reader(data, br.get_pos())
     local mcu_n = 0
@@ -470,13 +395,10 @@ function M.decode(data)
 
                 for bv = 0, c.v_samp - 1 do
                     for bh = 0, c.h_samp - 1 do
-
-                        -- ── DC coefficient ────────────────────────────────
                         local dc_cat  = c.dc_huff(sbr)
                         local dc_diff = extend(sbr.read(dc_cat), dc_cat)
                         c.dc_pred     = c.dc_pred + dc_diff
 
-                        -- ── AC coefficients ───────────────────────────────
                         for i = 1, 64 do zz[i] = 0 end
                         zz[1] = c.dc_pred
 
@@ -499,15 +421,12 @@ function M.decode(data)
                             end
                         end
 
-                        -- ── Dequantise (zigzag → natural order) ──────────
                         for i = 1, 64 do
                             dq[UNZIGZAG[i]] = zz[i] * qt[i]
                         end
 
-                        -- ── IDCT ─────────────────────────────────────────
                         local pixels = idct2d(dq)
 
-                        -- ── Write block into component plane ──────────────
                         local px0 = (mcu_col * c.h_samp + bh) * 8 + 1
                         local py0 = (mcu_row * c.v_samp + bv) * 8 + 1
                         for py = 0, 7 do
@@ -529,13 +448,6 @@ function M.decode(data)
         end  -- mcu_col
     end  -- mcu_row
 
-    --------------------------------------------------------------------------
-    -- Assemble output framebuffer: chroma upsample + YCbCr → RGB
-    --
-    -- For a pixel at (x, y) in the full-resolution image, the corresponding
-    -- sample in component ci's plane (which has sampling factors h_samp/max_h)
-    -- is:  cx = floor((x-1) * h_samp / max_h) + 1
-    --------------------------------------------------------------------------
 
     local c1 = comp_list[1]
     local c2 = comp_list[2]
@@ -600,10 +512,6 @@ function M.decode(data)
     return fb, img_w, img_h
 end
 
--------------------------------------------------------------------------------
--- Convenience: read a JPEG file from disk
--------------------------------------------------------------------------------
-
 function M.decode_file(path)
     local f, err = fs.open(path, "rb")
     if not f then
@@ -622,13 +530,6 @@ function M.decode_file(path)
     return M.decode(table.concat(chunks))
 end
 
--------------------------------------------------------------------------------
--- Convenience: fetch a JPEG over HTTP and decode it
---
--- Pass binary = true to http.get so we get raw bytes back.
--- Works with Navidrome's /rest/getCoverArt endpoint.
--------------------------------------------------------------------------------
-
 function M.decode_url(url, headers)
     assert(http, "[jpeg] the HTTP API is not available on this computer")
 
@@ -642,19 +543,6 @@ function M.decode_url(url, headers)
 
     return M.decode(body)
 end
-
--------------------------------------------------------------------------------
--- Convenience: one-shot fetch + draw to a monitor
---
--- Builds the palette with ccrt_draw's median-cut quantiser so the 16 colours
--- are chosen from the actual image content, not a fixed set.
---
--- Example:
---   local jpeg = require("jpeg_decode")
---   local mon  = peripheral.find("monitor")
---   mon.setTextScale(0.5)
---   jpeg.draw_url("http://navidrome/rest/getCoverArt?id=abc&size=64&...", mon)
--------------------------------------------------------------------------------
 
 function M.draw_url(url, mon, headers)
     local gfx = require("ccrt_draw")
@@ -670,12 +558,6 @@ function M.draw_file(path, mon)
     return fb, w, h
 end
 
--------------------------------------------------------------------------------
--- scale_fb: nearest-neighbour resize of a framebuffer
---
--- Returns a new framebuffer of size dw × dh.
--------------------------------------------------------------------------------
-
 function M.scale_fb(src, sw, sh, dw, dh)
     local dst = {}
     for y = 1, dh do
@@ -690,12 +572,6 @@ function M.scale_fb(src, sw, sh, dw, dh)
     return dst
 end
 
--------------------------------------------------------------------------------
--- letterbox: fit src (sw × sh) into a canvas (cw × ch) with black bars.
---
--- Scales the image to fill as much of the canvas as possible while preserving
--- the original aspect ratio, then centres it.  Requires ccrt_draw.
--------------------------------------------------------------------------------
 
 function M.letterbox(src, sw, sh, cw, ch)
     local gfx   = require("ccrt_draw")
