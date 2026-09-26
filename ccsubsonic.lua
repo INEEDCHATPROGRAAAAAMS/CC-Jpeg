@@ -1229,6 +1229,4 @@ while true do
             break
         end
     end
-
-    ::continue::
 end
