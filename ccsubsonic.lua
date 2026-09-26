@@ -1175,7 +1175,6 @@ if use_monitor and monitor_device then
     fix_text_colors()
 end
 
-::restart_outer::
 while true do
     -- Fetch playlists
     local pls_json = get_json(BASE_URL.."/rest/getPlaylists.view?f=json"..auth_q)
