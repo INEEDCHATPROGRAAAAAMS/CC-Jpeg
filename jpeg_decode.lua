@@ -1,41 +1,27 @@
--- jpeg_decode.lua  ──  Baseline DCT JPEG decoder for CC:Tweaked
--- Decodes to an RGB framebuffer compatible with ccrt_draw.lua
---
--- Usage:
---   local jpeg = require("jpeg_decode")
---   local gfx  = require("ccrt_draw")
---   local mon  = peripheral.find("monitor")
---   mon.setTextScale(0.5)
---
---   -- From a local file:
---   local fb, w, h = jpeg.decode_file("thumb.jpg")
---
---   -- From a URL (e.g. Navidrome getCoverArt):
---   local fb, w, h = jpeg.decode_url("http://host/rest/getCoverArt?...")
---
---   gfx.draw(fb, mon)
---
--- Supports: baseline DCT (SOF0), 4:2:0 / 4:2:2 / 4:4:4, grayscale,
---           restart markers.
--- Does NOT support: progressive, arithmetic coding, CMYK, 12-bit.
 
 local M = {}
+M.auto_yield = true
+
+local floor = math.floor
+local sbyte, sfind, ssub = string.byte, string.find, string.sub
+local concat = table.concat
+
+------------------------------------------------------------------------
+-- Constant tables (built once at load time)
+------------------------------------------------------------------------
 
 local pow2 = {}
-for i = 0, 32 do pow2[i] = 2 ^ i end
+do local p = 1; for i = 0, 32 do pow2[i] = p; p = p * 2 end end
 
-local COS = (function()
-    local t   = {}
-    local pi16 = math.pi / 16
-    for u = 0, 7 do
-        t[u] = {}
-        for x = 0, 7 do t[u][x] = math.cos((2 * x + 1) * u * pi16) end
-    end
-    return t
-end)()
+-- extend(): v < half[t]  ->  v - ext[t]      (ext[t] = 2^t - 1)
+local half, ext = {}, {}
+for t = 1, 16 do half[t] = pow2[t - 1]; ext[t] = pow2[t] - 1 end
 
-local ISQRT2 = 1 / math.sqrt(2)
+-- Run / size split of an AC symbol
+local RUN, CAT = {}, {}
+for s = 0, 255 do RUN[s] = floor(s / 16); CAT[s] = s % 16 end
 
+-- zigzag position (1-based) -> natural index (1-based)
 local UNZIGZAG = {
      1,  2,  9, 17, 10,  3,  4, 11,
     18, 25, 33, 26, 19, 12,  5,  6,
@@ -47,500 +33,594 @@ local UNZIGZAG = {
     54, 61, 62, 55, 48, 56, 63, 64,
 }
 
-
-local function make_byte_reader(data)
-    local pos = 1
-    local len = #data
-
-    local function u8()
-        if pos > len then return nil end
-        local b = data:byte(pos)
-        pos = pos + 1
-        return b
+-- AAN IDCT scale factors folded into the quantisation tables:
+-- S[n] = aan[row] * aan[col] / 8
+local SCALE = {}
+do
+    local aan = { [0] = 1 }
+    for k = 1, 7 do aan[k] = math.cos(k * math.pi / 16) * math.sqrt(2) end
+    for n = 1, 64 do
+        SCALE[n] = aan[floor((n - 1) / 8)] * aan[(n - 1) % 8] * 0.125
     end
-
-    local function u16()
-        local hi = data:byte(pos)
-        local lo = data:byte(pos + 1)
-        pos = pos + 2
-        return hi * 256 + lo
-    end
-
-    return {
-        u8      = u8,
-        u16     = u16,
-        skip    = function(n) pos = pos + n end,
-        get_pos = function() return pos end,
-    }
 end
 
-local function make_bit_reader(data, start_pos)
-    local pos  = start_pos
-    local dlen = #data
-    local buf  = 0       
-    local bits = 0       
-    local rst  = false   
-    local function fill()
-        while bits < 16 do
-            if pos > dlen then break end
-            local b = data:byte(pos)
-            pos = pos + 1
+-- Clamp table, offset by 300:  CL[v + 300] = clamp(v, 0, 255)
+local CL = {}
+for i = 0, 900 do
+    local v = i - 300
+    if v < 0 then v = 0 elseif v > 255 then v = 255 end
+    CL[i] = v
+end
 
-            if b == 0xFF then
-                local b2 = data:byte(pos)
-                if b2 == 0x00 then
-                    pos = pos + 1           
-                elseif b2 and b2 >= 0xD0 and b2 <= 0xD7 then
-                    pos = pos + 1          
-                    rst = true
-                    break
-                else
-                    break                   
+-- YCbCr -> RGB helpers.  Y is always an integer, so
+--   floor(Y + t + 0.5) == Y + floor(t + 0.5)
+-- which lets the per-channel offsets be tabulated exactly.  (+300 offset
+-- is pre-baked for the CL table.)
+local R_OFF, B_OFF, CB_G, CR_G = {}, {}, {}, {}
+for i = 0, 255 do
+    R_OFF[i] = floor(1.402 * (i - 128) + 0.5) + 300
+    B_OFF[i] = floor(1.772 * (i - 128) + 0.5) + 300
+    CB_G[i]  = -0.34414 * (i - 128)
+    CR_G[i]  = -0.71414 * (i - 128)
+end
+
+------------------------------------------------------------------------
+-- Huffman table builder: 9-bit direct lookup + canonical slow path
+------------------------------------------------------------------------
+
+local function make_huffman(cnts, syms)
+    local fs, fl = {}, {}          -- fast symbol / fast length (index = next 9 bits)
+    local mx, vp = {}, {}          -- maxcode[len], valptr[len]
+    local code, k = 0, 1
+    for l = 1, 16 do
+        local n = cnts[l]
+        vp[l] = k - code
+        if n > 0 then
+            if l <= 9 then
+                local span = pow2[9 - l]
+                for i = 0, n - 1 do
+                    local lo = (code + i) * span
+                    local s  = syms[k + i]
+                    for j = lo, lo + span - 1 do fs[j] = s; fl[j] = l end
                 end
             end
-
-            buf  = buf * 256 + b
-            bits = bits + 8
-        end
-    end
-
-    return {
-        -- Read n bits from the stream (0 ≤ n ≤ 16).
-        read = function(n)
-            if n == 0 then return 0 end
-            fill()
-            if bits < n then return 0 end   -- truncated stream
-            bits = bits - n
-            local v = math.floor(buf / pow2[bits]) % pow2[n]
-            buf  = buf % pow2[bits]
-            return v
-        end,
-
-        -- Call after each MCU.  Returns true if an RST marker was hit,
-        -- also clears the bit buffer so decoding re-aligns cleanly.
-        consume_rst = function()
-            if rst then
-                rst  = false
-                buf  = 0
-                bits = 0
-                return true
-            end
-            return false
-        end,
-    }
-end
-
-local function make_huffman(counts, syms)
-    local mincode = {}   -- mincode[i] = smallest code value for length i
-    local symbase = {}   -- symbase[i] = syms[] index of first code for length i
-    local cnt     = {}   -- cnt[i]     = number of codes for length i
-
-    local code   = 0
-    local symidx = 1
-    for i = 1, 16 do
-        cnt[i] = counts[i] or 0
-        if cnt[i] > 0 then
-            mincode[i] = code
-            symbase[i] = symidx
-            symidx = symidx + cnt[i]
-            code   = code + cnt[i]
+            code = code + n
+            k    = k + n
+            mx[l] = code - 1
         else
-            mincode[i] = -1
+            mx[l] = -1
         end
         code = code * 2
     end
-
-    -- Returned function decodes one symbol from bit reader `br`.
-    return function(br)
-        local v = 0
-        for i = 1, 16 do
-            v = v * 2 + br.read(1)
-            if cnt[i] > 0 then
-                local delta = v - mincode[i]
-                if delta >= 0 and delta < cnt[i] then
-                    return syms[symbase[i] + delta]
-                end
-            end
-        end
-        error("[jpeg] Huffman decode error")
-    end
+    return { fs = fs, fl = fl, mx = mx, vp = vp, vals = syms }
 end
 
-local function extend(v, t)
-    if t == 0 then return 0 end
-    if v < pow2[t - 1] then return v - pow2[t] + 1 end
-    return v
-end
+------------------------------------------------------------------------
+-- Inverse DCT (AAN float algorithm, same as libjpeg's jidctflt).
+-- Input : dq[1..64], natural order, already dequantised AND pre-scaled,
+--         with +128.5 baked into dq[1] (level shift + rounding).
+-- Output: clamped integers written straight into the MCU plane P.
+------------------------------------------------------------------------
 
+local dq, ws = {}, {}
+for i = 1, 64 do dq[i] = 0; ws[i] = 0 end
 
-local function idct2d(blk)
-    -- 1-D IDCT kernel.
-    -- Reads  a[0..7]  from a 0-indexed Lua table.
-    -- Writes o[0..7]  into a 0-indexed Lua table.
-    local function idct1d(a, o)
-        for x = 0, 7 do
-            local s = a[0] * ISQRT2
-            for u = 1, 7 do s = s + a[u] * COS[u][x] end
-            o[x] = s * 0.5
+local K1414, K1847, K1082, K2613 = 1.414213562, 1.847759065, 1.082392200, 2.613125930
+
+local function idct(P, base, pw)
+    -- Pass 1: columns
+    for c = 1, 8 do
+        local d0 = dq[c]
+        local d1, d2, d3, d4 = dq[c + 8], dq[c + 16], dq[c + 24], dq[c + 32]
+        local d5, d6, d7     = dq[c + 40], dq[c + 48], dq[c + 56]
+        if d1 == 0 and d2 == 0 and d3 == 0 and d4 == 0
+           and d5 == 0 and d6 == 0 and d7 == 0 then
+            ws[c]      = d0; ws[c + 8]  = d0; ws[c + 16] = d0; ws[c + 24] = d0
+            ws[c + 32] = d0; ws[c + 40] = d0; ws[c + 48] = d0; ws[c + 56] = d0
+        else
+            local t10 = d0 + d4
+            local t11 = d0 - d4
+            local t13 = d2 + d6
+            local t12 = (d2 - d6) * K1414 - t13
+            local e0, e3 = t10 + t13, t10 - t13
+            local e1, e2 = t11 + t12, t11 - t12
+
+            local z13 = d5 + d3
+            local z10 = d5 - d3
+            local z11 = d1 + d7
+            local z12 = d1 - d7
+            local o7  = z11 + z13
+            local z5  = (z10 + z12) * K1847
+            local o6  = (z5 - K2613 * z10) - o7
+            local o5  = (z11 - z13) * K1414 - o6
+            local o4  = (K1082 * z12 - z5) + o5
+
+            ws[c]      = e0 + o7; ws[c + 56] = e0 - o7
+            ws[c + 8]  = e1 + o6; ws[c + 48] = e1 - o6
+            ws[c + 16] = e2 + o5; ws[c + 40] = e2 - o5
+            ws[c + 32] = e3 + o4; ws[c + 24] = e3 - o4
         end
     end
 
-    -- Row pass: block coefficients → tmp (same layout, 1-indexed)
-    local tmp  = {}
-    local a    = {}
-    local o    = {}
+    -- Pass 2: rows
     for r = 0, 7 do
-        local base = r * 8
-        for c = 0, 7 do a[c] = blk[base + c + 1] end
-        idct1d(a, o)
-        for c = 0, 7 do tmp[base + c + 1] = o[c] end
-    end
+        local o = r * 8
+        local d0, d1, d2, d3 = ws[o + 1], ws[o + 2], ws[o + 3], ws[o + 4]
+        local d4, d5, d6, d7 = ws[o + 5], ws[o + 6], ws[o + 7], ws[o + 8]
 
-    -- Column pass → output with +128 level shift and [0,255] clamp
-    local out = {}
-    for c = 0, 7 do
-        for r = 0, 7 do a[r] = tmp[r * 8 + c + 1] end
-        idct1d(a, o)
-        for r = 0, 7 do
-            local p = o[r] * 0.5 + 128
-            if    p <   0 then p = 0
-            elseif p > 255 then p = 255 end
-            out[r * 8 + c + 1] = math.floor(p + 0.5)
+        local t10 = d0 + d4
+        local t11 = d0 - d4
+        local t13 = d2 + d6
+        local t12 = (d2 - d6) * K1414 - t13
+        local e0, e3 = t10 + t13, t10 - t13
+        local e1, e2 = t11 + t12, t11 - t12
+
+        local z13 = d5 + d3
+        local z10 = d5 - d3
+        local z11 = d1 + d7
+        local z12 = d1 - d7
+        local o7  = z11 + z13
+        local z5  = (z10 + z12) * K1847
+        local o6  = (z5 - K2613 * z10) - o7
+        local o5  = (z11 - z13) * K1414 - o6
+        local o4  = (K1082 * z12 - z5) + o5
+
+        local i = base + r * pw
+        local v
+        v = floor(e0 + o7); if v < 0 then v = 0 elseif v > 255 then v = 255 end; P[i + 1] = v
+        v = floor(e1 + o6); if v < 0 then v = 0 elseif v > 255 then v = 255 end; P[i + 2] = v
+        v = floor(e2 + o5); if v < 0 then v = 0 elseif v > 255 then v = 255 end; P[i + 3] = v
+        v = floor(e3 - o4); if v < 0 then v = 0 elseif v > 255 then v = 255 end; P[i + 4] = v
+        v = floor(e3 + o4); if v < 0 then v = 0 elseif v > 255 then v = 255 end; P[i + 5] = v
+        v = floor(e2 - o5); if v < 0 then v = 0 elseif v > 255 then v = 255 end; P[i + 6] = v
+        v = floor(e1 - o6); if v < 0 then v = 0 elseif v > 255 then v = 255 end; P[i + 7] = v
+        v = floor(e0 - o7); if v < 0 then v = 0 elseif v > 255 then v = 255 end; P[i + 8] = v
+    end
+end
+
+------------------------------------------------------------------------
+-- Entropy-coded data: split into restart segments, strip 0xFF00 stuffing
+------------------------------------------------------------------------
+
+local function split_segments(data, pos)
+    local segs, n = {}, 0
+    local pieces, np = {}, 0
+    while true do
+        local p = sfind(data, "\255", pos, true)
+        if not p then
+            np = np + 1; pieces[np] = ssub(data, pos)
+            break
+        end
+        local m = sbyte(data, p + 1)
+        if m == 0 then                                  -- stuffed 0xFF
+            np = np + 1; pieces[np] = ssub(data, pos, p)
+            pos = p + 2
+        elseif m and m >= 0xD0 and m <= 0xD7 then       -- RSTn
+            np = np + 1; pieces[np] = ssub(data, pos, p - 1)
+            n = n + 1; segs[n] = concat(pieces, "", 1, np)
+            np = 0
+            pos = p + 2
+        elseif m == 0xFF then                           -- fill byte
+            np = np + 1; pieces[np] = ssub(data, pos, p - 1)
+            pos = p + 1
+        else                                            -- EOI / other marker
+            np = np + 1; pieces[np] = ssub(data, pos, p - 1)
+            break
         end
     end
-    return out
+    n = n + 1; segs[n] = concat(pieces, "", 1, np)
+    return segs
+end
+
+------------------------------------------------------------------------
+-- Main decoder
+------------------------------------------------------------------------
+
+local function u16(s, p)
+    local a, b = sbyte(s, p, p + 1)
+    return a * 256 + b
 end
 
 function M.decode(data)
-    local br = make_byte_reader(data)
+    assert(sbyte(data, 1) == 0xFF and sbyte(data, 2) == 0xD8, "[jpeg] not a JPEG (bad SOI)")
 
-    -- Verify SOI marker
-    local m1, m2 = br.u8(), br.u8()
-    assert(m1 == 0xFF and m2 == 0xD8, "[jpeg] not a JPEG (bad SOI)")
-
-    local qtables  = {}   -- [id]    = array of 64 zigzag-ordered quant values
-    local huffdc   = {}   -- [id]    = DC Huffman decode function
-    local huffac   = {}   -- [id]    = AC Huffman decode function
-    local comps    = {}   -- [cid]   = component descriptor table
-
+    ----------------------------------------------------------------
+    -- 1. Headers
+    ----------------------------------------------------------------
+    local dlen = #data
+    local pos  = 3
+    local qtables, huffdc, huffac, comps = {}, {}, {}, {}
     local img_w, img_h, ncomp
-    local restart_interval = 0
+    local ri = 0
+    local scan_comps, scan_pos
 
-    local function next_marker()
-        local b = br.u8()
-        -- Sync to first 0xFF (skip any non-marker garbage)
-        while b and b ~= 0xFF do b = br.u8() end
-        -- Skip padding 0xFF bytes (JPEG allows multiple before a marker)
-        while b and b == 0xFF    do b = br.u8() end
-        return b   -- the actual marker type byte (without leading 0xFF)
-    end
-
-    while true do
-        local m = next_marker()
+    while pos < dlen do
+        local p = sfind(data, "\255", pos, true)
+        if not p then break end
+        local m = sbyte(data, p + 1)
+        while m == 0xFF do p = p + 1; m = sbyte(data, p + 1) end
         if not m then break end
-        if m == 0xD9 then
-            break
-        -- Parse the header, then break out to the scan decoder below.
-        elseif m == 0xDA then
-            local _len = br.u16()
-            local ns   = br.u8()
-            for _ = 1, ns do
-                local cid = br.u8()
-                local tbl = br.u8()
-                local c   = comps[cid]
-                c.dc_huff = huffdc[math.floor(tbl / 16)]
-                c.ac_huff = huffac[tbl % 16]
-            end
-            br.skip(3)   -- Ss, Se, Ah/Al  (baseline: 0x00, 0x3F, 0x00)
-            break         -- compressed data begins immediately here
+        pos = p + 2
+        if m == 0xD9 then break end
 
-        elseif m == 0xDB then
-            local len  = br.u16()
-            local done = 2
-            while done < len do
-                local pq   = br.u8()
-                local id   = pq % 16
-                local prec = math.floor(pq / 16)   -- 0 = 8-bit, 1 = 16-bit
-                local qt   = {}
-                if prec == 0 then
-                    for i = 1, 64 do qt[i] = br.u8() end
-                    done = done + 65
-                else
-                    for i = 1, 64 do qt[i] = br.u16() end
-                    done = done + 129
+        if m ~= 0x00 and m ~= 0x01 and not (m >= 0xD0 and m <= 0xD8) then
+            local len     = u16(data, pos)
+            local seg_end = pos + len
+            local q       = pos + 2
+
+            if m == 0xDB then                                   -- DQT
+                while q < seg_end do
+                    local pq   = sbyte(data, q)
+                    local id   = pq % 16
+                    local prec = floor(pq / 16)
+                    local qt   = {}
+                    q = q + 1
+                    if prec == 0 then
+                        for i = 1, 64 do qt[i] = sbyte(data, q + i - 1) end
+                        q = q + 64
+                    else
+                        for i = 1, 64 do qt[i] = u16(data, q + 2 * i - 2) end
+                        q = q + 128
+                    end
+                    qtables[id] = qt
                 end
-                qtables[id] = qt
-            end
 
-        elseif m == 0xC0 then
-            local _len  = br.u16()
-            local _prec = br.u8()       -- sample precision (almost always 8)
-            img_h = br.u16()
-            img_w = br.u16()
-            ncomp = br.u8()
-            for _ = 1, ncomp do
-                local cid  = br.u8()
-                local samp = br.u8()
-                local qtid = br.u8()
-                comps[cid] = {
-                    id      = cid,
-                    h_samp  = math.floor(samp / 16),  -- horizontal sampling factor
-                    v_samp  = samp % 16,               -- vertical   sampling factor
-                    qtid    = qtid,
-                    dc_pred = 0,   -- DC differential predictor (reset on RST)
-                    -- dc_huff and ac_huff are filled in during SOS parsing
-                }
-            end
-
-        elseif m == 0xC4 then
-            local len  = br.u16()
-            local done = 2
-            while done < len do
-                local b    = br.u8()
-                local tc   = math.floor(b / 16)   -- 0 = DC, 1 = AC
-                local th   = b % 16               -- table identifier
-                local cnts = {}
-                local total = 0
-                for i = 1, 16 do
-                    cnts[i] = br.u8()
-                    total   = total + cnts[i]
+            elseif m == 0xC0 or m == 0xC1 then                  -- SOF0 / SOF1
+                assert(sbyte(data, q) == 8, "[jpeg] only 8-bit precision is supported")
+                img_h = u16(data, q + 1)
+                img_w = u16(data, q + 3)
+                ncomp = sbyte(data, q + 5)
+                q = q + 6
+                for _ = 1, ncomp do
+                    local cid, samp, qtid = sbyte(data, q, q + 2)
+                    comps[cid] = { h = floor(samp / 16), v = samp % 16, qtid = qtid }
+                    q = q + 3
                 end
-                local syms = {}
-                for i = 1, total do syms[i] = br.u8() end
-                done = done + 1 + 16 + total
 
-                local huff = make_huffman(cnts, syms)
-                if tc == 0 then huffdc[th] = huff
-                else             huffac[th] = huff end
+            elseif m == 0xC2 or m == 0xC3 or (m >= 0xC5 and m <= 0xC7)
+                or (m >= 0xC9 and m <= 0xCB) or (m >= 0xCD and m <= 0xCF) then
+                error("[jpeg] unsupported JPEG type (progressive/lossless/arithmetic)", 2)
+
+            elseif m == 0xC4 then                               -- DHT
+                while q < seg_end do
+                    local b  = sbyte(data, q)
+                    local tc = floor(b / 16)
+                    local th = b % 16
+                    local cnts, total = {}, 0
+                    for i = 1, 16 do
+                        local n = sbyte(data, q + i)
+                        cnts[i] = n; total = total + n
+                    end
+                    q = q + 17
+                    local syms = {}
+                    for i = 1, total do syms[i] = sbyte(data, q + i - 1) end
+                    q = q + total
+                    local h = make_huffman(cnts, syms)
+                    if tc == 0 then huffdc[th] = h else huffac[th] = h end
+                end
+
+            elseif m == 0xDD then                               -- DRI
+                ri = u16(data, q)
+
+            elseif m == 0xDA then                               -- SOS
+                assert(img_w and img_h and ncomp, "[jpeg] SOF not found before SOS")
+                local ns = sbyte(data, q)
+                q = q + 1
+                assert(ns == ncomp, "[jpeg] multi-scan (non-interleaved) JPEG not supported")
+                scan_comps = {}
+                for i = 1, ns do
+                    local cid, tbl = sbyte(data, q, q + 1)
+                    q = q + 2
+                    local c = assert(comps[cid], "[jpeg] scan references unknown component")
+                    c.dc = assert(huffdc[floor(tbl / 16)], "[jpeg] missing DC Huffman table")
+                    c.ac = assert(huffac[tbl % 16],        "[jpeg] missing AC Huffman table")
+                    scan_comps[i] = c
+                end
+                scan_pos = seg_end
+                break
             end
-        elseif m == 0xDD then
-            br.u16()                       -- length (always 4)
-            restart_interval = br.u16()
 
-        -- ── RST markers at top level (shouldn't happen, ignore)
-        elseif m >= 0xD0 and m <= 0xD7 then
-            -- nothing
-        else
-            local len = br.u16()
-            br.skip(len - 2)
+            pos = seg_end
         end
     end
 
-    assert(img_w and img_h and ncomp, "[jpeg] SOF0 not found before SOS")
+    assert(scan_comps, "[jpeg] no scan found")
+    assert(ncomp == 1 or ncomp == 3, "[jpeg] only grayscale and 3-component JPEGs are supported")
 
+    ----------------------------------------------------------------
+    -- 2. Geometry and per-component setup
+    ----------------------------------------------------------------
+    if ncomp == 1 then scan_comps[1].h = 1; scan_comps[1].v = 1 end
 
-    -- Components are almost always identified as 1, 2, 3 (Y, Cb, Cr).
-    -- Fall back to whatever we have if IDs are non-standard.
-    local comp_list = {}
-    for id = 1, 3 do
-        if comps[id] then comp_list[#comp_list + 1] = comps[id] end
-    end
-    if #comp_list ~= ncomp then
-        comp_list = {}
-        for _, c in pairs(comps) do comp_list[#comp_list + 1] = c end
-    end
-
-    -- Maximum sampling factors determine the MCU size.
     local max_h, max_v = 1, 1
-    for _, c in ipairs(comp_list) do
-        if c.h_samp > max_h then max_h = c.h_samp end
-        if c.v_samp > max_v then max_v = c.v_samp end
+    for i = 1, ncomp do
+        local c = scan_comps[i]
+        if c.h > max_h then max_h = c.h end
+        if c.v > max_v then max_v = c.v end
     end
 
-    -- MCU size in pixels (typically 16×16 for 4:2:0, 8×8 for 4:4:4)
-    local mcu_w = max_h * 8
-    local mcu_h = max_v * 8
-
-    -- Number of MCUs across and down
+    local mcu_w, mcu_h = max_h * 8, max_v * 8
     local mcus_x = math.ceil(img_w / mcu_w)
     local mcus_y = math.ceil(img_h / mcu_h)
 
-
-    local planes = {}
-    for ci, c in ipairs(comp_list) do
-        local pw = mcus_x * c.h_samp * 8
-        local ph = mcus_y * c.v_samp * 8
-        local rows = {}
-        for y = 1, ph do
-            local row = {}
-            for x = 1, pw do row[x] = 128 end   -- neutral grey default
-            rows[y] = row
-        end
-        planes[ci] = { rows = rows }
+    local pred = {}
+    for i = 1, ncomp do
+        local c  = scan_comps[i]
+        local qt = assert(qtables[c.qtid], "[jpeg] missing quantisation table")
+        local qs = {}
+        for k = 1, 64 do qs[k] = qt[k] * SCALE[UNZIGZAG[k]] end   -- dequant + AAN prescale
+        c.qs = qs
+        c.pw = c.h * 8
+        c.P  = {}
+        pred[i] = 0
     end
 
+    local c1, c2, c3 = scan_comps[1], scan_comps[2], scan_comps[3]
+    local P1, pw1 = c1.P, c1.pw
+    assert(c1.h == max_h and c1.v == max_v, "[jpeg] luma must have the maximum sampling factors")
 
-    local sbr   = make_bit_reader(data, br.get_pos())
-    local mcu_n = 0
+    local P2, P3, RO, GO, BO, xmap, ymap, pw2, cn
+    if ncomp == 3 then
+        assert(c2.h == c3.h and c2.v == c3.v, "[jpeg] Cb/Cr with different sampling not supported")
+        P2, P3 = c2.P, c3.P
+        pw2 = c2.pw
+        cn  = pw2 * c2.v * 8
+        RO, GO, BO = {}, {}, {}
+        xmap, ymap = {}, {}
+        for x = 1, mcu_w do xmap[x] = floor((x - 1) * c2.h / max_h) + 1 end
+        for y = 0, mcu_h - 1 do ymap[y] = floor(y * c2.v / max_v) * pw2 end
+    end
 
-    -- Scratch tables reused each block to avoid lots of GC pressure
-    local zz = {}  -- zigzag coefficient array
-    local dq = {}  -- dequantised, natural-order array
+    ----------------------------------------------------------------
+    -- 3. Entropy-coded scan -> pixels
+    ----------------------------------------------------------------
+    local segs    = split_segments(data, scan_pos)
+    local seg_i   = 1
+    local seg     = segs[1]
+    local spos    = 1        -- next byte to read from `seg`
+    local acc, nb = 0, 0     -- bit accumulator (always acc < 2^nb), bit count
+    local rst_left = ri
+
+    local tl = { 1 }         -- indices of non-zero entries in dq (dq[1] always)
+    local nt
+
+    local fb = {}
+    for y = 1, img_h do fb[y] = {} end
+
+    local can_yield = M.auto_yield and os and os.queueEvent and os.pullEvent and os.clock
+    local last_yield = can_yield and os.clock() or 0
 
     for mcu_row = 0, mcus_y - 1 do
         for mcu_col = 0, mcus_x - 1 do
 
-            -- Restart interval: reset DC predictors before this MCU if needed
-            if restart_interval > 0 and mcu_n > 0
-               and mcu_n % restart_interval == 0 then
-                for _, c in ipairs(comp_list) do c.dc_pred = 0 end
-                sbr.consume_rst()
+            -- Restart interval: move to the next segment, reset state
+            if ri > 0 then
+                if rst_left == 0 then
+                    seg_i = seg_i + 1
+                    seg   = segs[seg_i] or ""
+                    spos, acc, nb = 1, 0, 0
+                    for i = 1, ncomp do pred[i] = 0 end
+                    rst_left = ri
+                end
+                rst_left = rst_left - 1
             end
-            mcu_n = mcu_n + 1
 
-            -- Decode each component's block(s) within this MCU
-            for ci, c in ipairs(comp_list) do
-                local qt    = qtables[c.qtid]
-                local plane = planes[ci]
+            ----------------------------------------------------------
+            -- Decode every block of this MCU into the component planes
+            ----------------------------------------------------------
+            for ci = 1, ncomp do
+                local c   = scan_comps[ci]
+                local P, pw, qs = c.P, c.pw, c.qs
+                local dc, ac = c.dc, c.ac
+                local dfs, dfl, dmx, dvp, dvals = dc.fs, dc.fl, dc.mx, dc.vp, dc.vals
+                local afs, afl, amx, avp, avals = ac.fs, ac.fl, ac.mx, ac.vp, ac.vals
+                local dcp = pred[ci]
 
-                for bv = 0, c.v_samp - 1 do
-                    for bh = 0, c.h_samp - 1 do
-                        local dc_cat  = c.dc_huff(sbr)
-                        local dc_diff = extend(sbr.read(dc_cat), dc_cat)
-                        c.dc_pred     = c.dc_pred + dc_diff
+                for bv = 0, c.v - 1 do
+                    for bh = 0, c.h - 1 do
+                        local base = bv * 8 * pw + bh * 8
 
-                        for i = 1, 64 do zz[i] = 0 end
-                        zz[1] = c.dc_pred
-
-                        local k = 2
-                        while k <= 64 do
-                            local sym = c.ac_huff(sbr)
-                            if sym == 0x00 then
-                                break                   -- EOB: rest are zeros
-                            end
-                            local run = math.floor(sym / 16)
-                            local cat = sym % 16
-                            if run == 15 and cat == 0 then
-                                k = k + 16              -- ZRL: skip 16 zeros
+                        ---------------- DC ----------------
+                        if nb < 16 then
+                            if nb < 9 then
+                                local a, b = sbyte(seg, spos, spos + 1)
+                                acc = acc * 65536 + (a or 0) * 256 + (b or 0)
+                                nb = nb + 16; spos = spos + 2
                             else
-                                k = k + run             -- skip `run` zeros
-                                if k <= 64 then
-                                    zz[k] = extend(sbr.read(cat), cat)
-                                    k = k + 1
+                                acc = acc * 256 + (sbyte(seg, spos) or 0)
+                                nb = nb + 8; spos = spos + 1
+                            end
+                        end
+                        local peek = floor(acc / pow2[nb - 9])
+                        local s
+                        local l = dfl[peek]
+                        if l then
+                            s = dfs[peek]; nb = nb - l; acc = acc % pow2[nb]
+                        else
+                            for ln = 10, 16 do
+                                local code = floor(acc / pow2[nb - ln])
+                                if code <= dmx[ln] then
+                                    s = dvals[dvp[ln] + code]
+                                    nb = nb - ln; acc = acc % pow2[nb]
+                                    break
                                 end
                             end
+                            if not s then error("[jpeg] Huffman decode error") end
                         end
-
-                        for i = 1, 64 do
-                            dq[UNZIGZAG[i]] = zz[i] * qt[i]
+                        if s > 0 then
+                            if nb < s then
+                                if nb < 9 then
+                                    local a, b = sbyte(seg, spos, spos + 1)
+                                    acc = acc * 65536 + (a or 0) * 256 + (b or 0)
+                                    nb = nb + 16; spos = spos + 2
+                                else
+                                    acc = acc * 256 + (sbyte(seg, spos) or 0)
+                                    nb = nb + 8; spos = spos + 1
+                                end
+                            end
+                            nb = nb - s
+                            local pw_ = pow2[nb]
+                            local v = floor(acc / pw_)
+                            acc = acc % pw_
+                            if v < half[s] then v = v - ext[s] end
+                            dcp = dcp + v
                         end
+                        dq[1] = dcp * qs[1] + 128.5     -- level shift + rounding bias
+                        nt = 1
 
-                        local pixels = idct2d(dq)
+                        ---------------- AC ----------------
+                        local k = 2
+                        while k <= 64 do
+                            if nb < 16 then
+                                if nb < 9 then
+                                    local a, b = sbyte(seg, spos, spos + 1)
+                                    acc = acc * 65536 + (a or 0) * 256 + (b or 0)
+                                    nb = nb + 16; spos = spos + 2
+                                else
+                                    acc = acc * 256 + (sbyte(seg, spos) or 0)
+                                    nb = nb + 8; spos = spos + 1
+                                end
+                            end
+                            peek = floor(acc / pow2[nb - 9])
+                            l = afl[peek]
+                            if l then
+                                s = afs[peek]; nb = nb - l; acc = acc % pow2[nb]
+                            else
+                                s = nil
+                                for ln = 10, 16 do
+                                    local code = floor(acc / pow2[nb - ln])
+                                    if code <= amx[ln] then
+                                        s = avals[avp[ln] + code]
+                                        nb = nb - ln; acc = acc % pow2[nb]
+                                        break
+                                    end
+                                end
+                                if not s then error("[jpeg] Huffman decode error") end
+                            end
 
-                        local px0 = (mcu_col * c.h_samp + bh) * 8 + 1
-                        local py0 = (mcu_row * c.v_samp + bv) * 8 + 1
-                        for py = 0, 7 do
-                            local row = plane.rows[py0 + py]
-                            for px = 0, 7 do
-                                row[px0 + px] = pixels[py * 8 + px + 1]
+                            if s == 0 then break end            -- EOB
+
+                            local cat = CAT[s]
+                            if cat == 0 then
+                                k = k + RUN[s] + 1              -- ZRL (skip 16 zeros)
+                            else
+                                k = k + RUN[s]
+                                if nb < cat then
+                                    if nb < 9 then
+                                        local a, b = sbyte(seg, spos, spos + 1)
+                                        acc = acc * 65536 + (a or 0) * 256 + (b or 0)
+                                        nb = nb + 16; spos = spos + 2
+                                    else
+                                        acc = acc * 256 + (sbyte(seg, spos) or 0)
+                                        nb = nb + 8; spos = spos + 1
+                                    end
+                                end
+                                nb = nb - cat
+                                local pw_ = pow2[nb]
+                                local v = floor(acc / pw_)
+                                acc = acc % pw_
+                                if k <= 64 then
+                                    if v < half[cat] then v = v - ext[cat] end
+                                    local nat = UNZIGZAG[k]
+                                    nt = nt + 1; tl[nt] = nat
+                                    dq[nat] = v * qs[k]
+                                end
+                                k = k + 1
                             end
                         end
 
-                    end  -- bh
-                end  -- bv
-            end  -- components
-
-            -- Check for an RST marker that was hit mid-stream while reading
-            if sbr.consume_rst() then
-                for _, c in ipairs(comp_list) do c.dc_pred = 0 end
+                        ---------------- IDCT -> plane ----------------
+                        if nt == 1 then
+                            -- DC only: flat block
+                            local v = floor(dq[1])
+                            if v < 0 then v = 0 elseif v > 255 then v = 255 end
+                            for r = 0, 7 do
+                                local i = base + r * pw
+                                P[i + 1] = v; P[i + 2] = v; P[i + 3] = v; P[i + 4] = v
+                                P[i + 5] = v; P[i + 6] = v; P[i + 7] = v; P[i + 8] = v
+                            end
+                        else
+                            idct(P, base, pw)
+                        end
+                        for i = 1, nt do dq[tl[i]] = 0 end
+                    end
+                end
+                pred[ci] = dcp
             end
 
-        end  -- mcu_col
-    end  -- mcu_row
-
-
-    local c1 = comp_list[1]
-    local c2 = comp_list[2]
-    local c3 = comp_list[3]
-
-    local rows1 = planes[1].rows
-    local rows2 = c2 and planes[2].rows
-    local rows3 = c3 and planes[3].rows
-
-    local h2 = c2 and c2.h_samp or 1
-    local v2 = c2 and c2.v_samp or 1
-    local h3 = c3 and c3.h_samp or 1
-    local v3 = c3 and c3.v_samp or 1
-
-    local fb = {}
-    for y = 1, img_h do
-        local fb_row = {}
-        local row1   = rows1[y]
-
-        -- Pre-compute Cb/Cr row index (stays constant across a whole image row)
-        local cy2, cy3
-        if ncomp > 1 then
-            cy2 = math.floor((y - 1) * v2 / max_v) + 1
-            cy3 = math.floor((y - 1) * v3 / max_v) + 1
-        end
-        local row2 = rows2 and rows2[cy2]
-        local row3 = rows3 and rows3[cy3]
-
-        for x = 1, img_w do
-            local Y  = row1[x]
-            local Cb, Cr
+            ----------------------------------------------------------
+            -- Colour conversion straight into the framebuffer
+            ----------------------------------------------------------
+            local x0, y0 = mcu_col * mcu_w, mcu_row * mcu_h
+            local xlim, ylim = mcu_w, mcu_h
+            if x0 + xlim > img_w then xlim = img_w - x0 end
+            if y0 + ylim > img_h then ylim = img_h - y0 end
 
             if ncomp == 1 then
-                Cb = 128; Cr = 128
+                for y = 0, ylim - 1 do
+                    local row = fb[y0 + y + 1]
+                    local o   = y * pw1
+                    for x = 1, xlim do
+                        local v = P1[o + x]
+                        row[x0 + x] = { v, v, v }
+                    end
+                end
             else
-                local cx2 = math.floor((x - 1) * h2 / max_h) + 1
-                local cx3 = math.floor((x - 1) * h3 / max_h) + 1
-                Cb = row2[cx2]
-                Cr = row3[cx3]
+                -- per-chroma-sample offsets (computed once per sample, not per pixel)
+                for i = 1, cn do
+                    local cb, cr = P2[i], P3[i]
+                    RO[i] = R_OFF[cr]
+                    GO[i] = floor(CB_G[cb] + CR_G[cr] + 0.5) + 300
+                    BO[i] = B_OFF[cb]
+                end
+                for y = 0, ylim - 1 do
+                    local row = fb[y0 + y + 1]
+                    local o   = y * pw1
+                    local co  = ymap[y]
+                    for x = 1, xlim do
+                        local ci = co + xmap[x]
+                        local Y  = P1[o + x]
+                        row[x0 + x] = { CL[Y + RO[ci]], CL[Y + GO[ci]], CL[Y + BO[ci]] }
+                    end
+                end
             end
-
-            -- BT.601 YCbCr → linear RGB
-            local R = Y + 1.402   * (Cr - 128)
-            local G = Y - 0.34414 * (Cb - 128) - 0.71414 * (Cr - 128)
-            local B = Y + 1.772   * (Cb - 128)
-
-            -- Clamp and round to [0, 255]
-            if R <   0 then R =   0 elseif R > 255 then R = 255 end
-            if G <   0 then G =   0 elseif G > 255 then G = 255 end
-            if B <   0 then B =   0 elseif B > 255 then B = 255 end
-
-            fb_row[x] = {
-                math.floor(R + 0.5),
-                math.floor(G + 0.5),
-                math.floor(B + 0.5),
-            }
         end
 
-        fb[y] = fb_row
+        if can_yield then
+            local t = os.clock()
+            if t - last_yield > 2 then
+                os.queueEvent("jpeg_yield")
+                os.pullEvent("jpeg_yield")
+                last_yield = os.clock()
+            end
+        end
     end
 
     return fb, img_w, img_h
 end
+
+------------------------------------------------------------------------
+-- I/O helpers
+------------------------------------------------------------------------
 
 function M.decode_file(path)
     local f, err = fs.open(path, "rb")
     if not f then
         error("[jpeg] cannot open '" .. path .. "': " .. tostring(err), 2)
     end
-
-    -- Read all bytes; fs binary-mode read() returns one byte at a time.
-    local chunks = {}
-    local b = f.read()
-    while b do
-        chunks[#chunks + 1] = string.char(b)
-        b = f.read()
-    end
+    local data = f.readAll()
     f.close()
-
-    return M.decode(table.concat(chunks))
+    return M.decode(data)
 end
 
 function M.decode_url(url, headers)
     assert(http, "[jpeg] the HTTP API is not available on this computer")
-
     local res, err = http.get(url, headers or {}, true)  -- true = binary mode
     if not res then
         error("[jpeg] HTTP request failed for <" .. url .. ">: " .. tostring(err), 2)
     end
-
     local body = res.readAll()
     res.close()
-
     return M.decode(body)
 end
 
@@ -558,28 +638,33 @@ function M.draw_file(path, mon)
     return fb, w, h
 end
 
+------------------------------------------------------------------------
+-- Scaling helpers
+------------------------------------------------------------------------
+
 function M.scale_fb(src, sw, sh, dw, dh)
+    local xmap = {}
+    for x = 1, dw do xmap[x] = floor((x - 1) * sw / dw) + 1 end
     local dst = {}
     for y = 1, dh do
         local row  = {}
-        local srow = src[math.floor((y - 1) * sh / dh) + 1]
+        local srow = src[floor((y - 1) * sh / dh) + 1]
         for x = 1, dw do
-            local p = srow[math.floor((x - 1) * sw / dw) + 1]
-            row[x] = {p[1], p[2], p[3]}
+            local p = srow[xmap[x]]
+            row[x] = { p[1], p[2], p[3] }
         end
         dst[y] = row
     end
     return dst
 end
 
-
 function M.letterbox(src, sw, sh, cw, ch)
     local gfx   = require("ccrt_draw")
     local scale = math.min(cw / sw, ch / sh)
-    local dw    = math.max(1, math.floor(sw * scale))
-    local dh    = math.max(1, math.floor(sh * scale))
-    local ox    = math.floor((cw - dw) / 2) + 1
-    local oy    = math.floor((ch - dh) / 2) + 1
+    local dw    = math.max(1, floor(sw * scale))
+    local dh    = math.max(1, floor(sh * scale))
+    local ox    = floor((cw - dw) / 2) + 1
+    local oy    = floor((ch - dh) / 2) + 1
 
     local scaled = M.scale_fb(src, sw, sh, dw, dh)
     local canvas = gfx.make_fb(cw, ch, 0, 0, 0)
