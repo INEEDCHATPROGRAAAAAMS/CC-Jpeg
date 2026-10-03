@@ -2,7 +2,10 @@ local DEFAULT_BASE_URL = "https://demo.navidrome.org/"
 local BASE_URL = DEFAULT_BASE_URL
 local CLIENT_NAME = "CCSubsonic"
 local SUBSONIC_VERSION = "1.16.1"
-local MAX_BUFFER = 10
+local NETWORK_READ_SIZE = 65536       -- bytes read from the HTTP stream at once
+local PLAYBACK_CHUNK_SIZE = 8192      -- PCM samples handed to the speaker at once
+local TARGET_BUFFER_SECONDS = 5       -- keep about this much decoded audio locally
+local START_BUFFER_SECONDS = 2        -- do not start playback until this much is ready
 local THUMB_ROW_OFFSET = 1
 local SAMPLE_RATE       = 48000
 local TIMESTAMP_RESERVE = 11
@@ -710,35 +713,89 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
     input_state.back = false
     input_state.cancelled = false
     input_state.elapsed_samples = 0
-    update_album_art(tr, auth_q, input_state)
-    os.sleep(0.05)
 
-    draw_full_ui(tr)
-    draw_touch_buttons(tr, input_state)
-    draw_progress(tr, input_state)
-
+    -- Open the stream before album-art work so buffering can happen concurrently.
     local url = BASE_URL.."/rest/stream.view?id="..urlencode(tr.id).."&format=dfpwm"..auth_q
     local resp = http.get(url, {binary=true})
     if not resp then return false end
 
     local decoder = require("cc.audio.dfpwm").make_decoder()
-    local pcmBuffer = {}
+    local pcmQueue = {}
+    local queueHead = 1
+    local queueTail = 0
+    local buffered_samples = 0
     local streaming_done = false
     local stop = false
+    local startup_ready = false
     local next_ping = os.clock() + 10
+
+    local target_buffer_samples = math.floor(TARGET_BUFFER_SECONDS * SAMPLE_RATE)
+    local start_buffer_samples = math.floor(START_BUFFER_SECONDS * SAMPLE_RATE)
 
     send_now_playing(tr.id, auth_q)
 
-    local function fill_buffer()
-        while not stop and #pcmBuffer < MAX_BUFFER do
-            local chunk = resp.read(2048)
-            if not chunk then
-                streaming_done = true
+    local function enqueue_pcm(pcm)
+        local pos = 1
+        local len = #pcm
+        while pos <= len and not stop do
+            local take = math.min(PLAYBACK_CHUNK_SIZE, len - pos + 1)
+            local chunk = {}
+            for i = 0, take - 1 do
+                chunk[i + 1] = pcm[pos + i]
+            end
+            queueTail = queueTail + 1
+            pcmQueue[queueTail] = chunk
+            buffered_samples = buffered_samples + #chunk
+            pos = pos + take
+            if pos <= len then os.sleep(0) end
+        end
+    end
+
+    local function dequeue_pcm()
+        if queueHead > queueTail then return nil end
+        local chunk = pcmQueue[queueHead]
+        pcmQueue[queueHead] = nil
+        queueHead = queueHead + 1
+        buffered_samples = buffered_samples - #chunk
+        return chunk
+    end
+
+    local function put_back_pcm(chunk)
+        queueHead = queueHead - 1
+        pcmQueue[queueHead] = chunk
+        buffered_samples = buffered_samples + #chunk
+    end
+
+    local function network_loop()
+        while not stop and not streaming_done do
+            if buffered_samples < target_buffer_samples then
+                local data = resp.read(NETWORK_READ_SIZE)
+                if not data then
+                    streaming_done = true
+                    break
+                end
+                local pcm = decoder(data)
+                if #pcm > 0 then enqueue_pcm(pcm) end
+                os.sleep(0)
+            else
+                os.sleep(0.05)
+            end
+        end
+    end
+
+    local function startup_loop()
+        update_album_art(tr, auth_q, input_state)
+        os.sleep(0.05)
+        draw_full_ui(tr)
+        draw_touch_buttons(tr, input_state)
+        while not stop do
+            if buffered_samples >= start_buffer_samples or streaming_done then
+                startup_ready = true
                 break
             end
-            local pcm = decoder(chunk)
-            if #pcm > 0 then table.insert(pcmBuffer, pcm) end
+            os.sleep(0.01)
         end
+        while not stop do os.sleep(0.1) end
     end
 
     local function input_loop()
@@ -752,39 +809,42 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
     end
 
     local function audio_loop()
-        fill_buffer()
-
-        local next_progress_update = 0
-
-        while not stop and (not streaming_done or #pcmBuffer > 0) do
-            if os.clock() >= next_progress_update then
-                draw_progress(tr, input_state)
-                next_progress_update = os.clock() + 0.5
-            end
-
-            if next_ping and os.clock() >= next_ping then
-                pcall(send_now_playing, tr.id, auth_q)
-                next_ping = os.clock() + 10
-            end
-
+        while not stop and not startup_ready do
             if input_state.back or input_state.skip_forward or input_state.skip_back then
                 stop = true
                 break
             end
+            os.sleep(0.01)
+        end
 
-            if not streaming_done and #pcmBuffer < MAX_BUFFER then
-                fill_buffer()
+        draw_progress(tr, input_state)
+        local next_progress_update = 0
+
+        while not stop and (not streaming_done or buffered_samples > 0) do
+            if os.clock() >= next_progress_update then
+                draw_progress(tr, input_state)
+                next_progress_update = os.clock() + 0.5
             end
-
-            if not input_state.paused and #pcmBuffer > 0 then
-                local chunk = table.remove(pcmBuffer, 1)
-                local adj = resample_pcm(chunk, input_state.speed)
-                if not speaker.playAudio(adj, input_state.volume) then
-                    table.insert(pcmBuffer, 1, chunk)
-                    os.sleep(0.01)
+            if next_ping and os.clock() >= next_ping then
+                pcall(send_now_playing, tr.id, auth_q)
+                next_ping = os.clock() + 10
+            end
+            if input_state.back or input_state.skip_forward or input_state.skip_back then
+                stop = true
+                break
+            end
+            if not input_state.paused then
+                local chunk = dequeue_pcm()
+                if chunk then
+                    local adj = resample_pcm(chunk, input_state.speed)
+                    if not speaker.playAudio(adj, input_state.volume) then
+                        put_back_pcm(chunk)
+                        os.sleep(0.01)
+                    else
+                        input_state.elapsed_samples = (input_state.elapsed_samples or 0) + #chunk
+                    end
                 else
-                    input_state.elapsed_samples =
-                        (input_state.elapsed_samples or 0) + #chunk
+                    os.sleep(0.01)
                 end
             else
                 os.sleep(0.01)
@@ -792,7 +852,8 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
         end
         stop = true
     end
-    parallel.waitForAny(audio_loop, input_loop)
+
+    parallel.waitForAny(audio_loop, input_loop, network_loop, startup_loop)
 
     input_state.cancelled = true
     resp.close()
@@ -804,7 +865,6 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
     elseif input_state.skip_back then
         action = "skip_back"
     end
-
     return input_state.volume, input_state.speed, action
 end
 
