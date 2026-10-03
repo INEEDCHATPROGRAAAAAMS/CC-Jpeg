@@ -3,7 +3,7 @@ local BASE_URL = DEFAULT_BASE_URL
 local CLIENT_NAME = "CCSubsonic"
 local SUBSONIC_VERSION = "1.16.1"
 local NETWORK_READ_SIZE = 65536       -- bytes read from the HTTP stream at once
-local PLAYBACK_CHUNK_SIZE = 8192      -- PCM samples handed to the speaker at once
+local PLAYBACK_CHUNK_SIZE = 4096     -- PCM samples handed to the speaker at once
 local TARGET_BUFFER_SECONDS = 5       -- keep about this much decoded audio locally
 local START_BUFFER_SECONDS = 2        -- do not start playback until this much is ready
 local THUMB_ROW_OFFSET = 1
@@ -266,6 +266,9 @@ local function quantize_to_canvas(rgb_fb, palette, target_w, target_h)
             local idx = nearest_idx(rgb[1], rgb[2], rgb[3], palette)
             canvas[y][x] = 2 ^ idx
         end
+        -- Yield periodically so the network/audio coroutines keep running
+        -- while we quantize a large cover image.
+        if y % 8 == 0 then os.sleep(0) end
     end
     return canvas
 end
@@ -683,6 +686,9 @@ local function update_album_art(track, auth_q)
         for x = 1, sw do
             current_box.canvas[oy + y - 1][ox + x - 1] = row[x]
         end
+        -- Yield periodically so the audio coroutine is not starved while
+        -- we copy the scaled image into the pixelbox canvas.
+        if y % 8 == 0 then os.sleep(0) end
     end
 
     current_box:render()
@@ -783,9 +789,10 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
         end
     end
 
+    -- Draw the UI and bind keys immediately, then wait only on the audio
+    -- buffer. Album art is handled by its own coroutine so a slow cover
+    -- download cannot delay the first sample of the track.
     local function startup_loop()
-        update_album_art(tr, auth_q, input_state)
-        os.sleep(0.05)
         draw_full_ui(tr)
         draw_touch_buttons(tr, input_state)
         while not stop do
@@ -795,6 +802,18 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
             end
             os.sleep(0.01)
         end
+        while not stop do os.sleep(0.1) end
+    end
+
+    -- Runs in parallel with playback. Once the image is on screen, repaint
+    -- the text UI because pixelbox:render() blits a full-terminal canvas
+    -- and wipes whatever was underneath.
+    local function album_art_loop()
+        pcall(update_album_art, tr, auth_q)
+        fix_text_colors()
+        draw_full_ui(tr)
+        draw_touch_buttons(tr, input_state)
+        draw_progress(tr, input_state)
         while not stop do os.sleep(0.1) end
     end
 
@@ -853,7 +872,7 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
         stop = true
     end
 
-    parallel.waitForAny(audio_loop, input_loop, network_loop, startup_loop)
+    parallel.waitForAny(audio_loop, input_loop, network_loop, startup_loop, album_art_loop)
 
     input_state.cancelled = true
     resp.close()
