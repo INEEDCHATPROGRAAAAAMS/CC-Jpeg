@@ -3,7 +3,7 @@ local BASE_URL = DEFAULT_BASE_URL
 local CLIENT_NAME = "CCSubsonic"
 local SUBSONIC_VERSION = "1.16.1"
 local NETWORK_READ_SIZE = 65536       -- bytes read from the HTTP stream at once
-local PLAYBACK_CHUNK_SIZE = 4096     -- PCM samples handed to the speaker at once
+local PLAYBACK_CHUNK_SIZE = 4096    -- PCM samples handed to the speaker at once
 local TARGET_BUFFER_SECONDS = 5       -- keep about this much decoded audio locally
 local START_BUFFER_SECONDS = 2        -- do not start playback until this much is ready
 local THUMB_ROW_OFFSET = 1
@@ -11,7 +11,7 @@ local SAMPLE_RATE       = 48000
 local TIMESTAMP_RESERVE = 11
 local UI_ROWS_BAR       = 5
 local UI_ROWS_PLAIN     = 4
-local MAX_COVER_SIZE = 480
+local MAX_COVER_SIZE = 128
 
 
 if not fs.exists("/ccsubsonic")     then fs.makeDir("/ccsubsonic") end
@@ -19,9 +19,50 @@ local LIB_DIR = "/ccsubsonic/"
 
 package.path = LIB_DIR .. "/?.lua;" .. package.path
 
+-- ---------------------------------------------------------------------------
+-- Debug logger
+-- ---------------------------------------------------------------------------
+local DEBUG_LOG_PATH = LIB_DIR .. "debug.log"
+local LOG_ENABLED = false
+
+local function log(area, msg)
+    if not LOG_ENABLED then return end
+    local ok, f = pcall(fs.open, DEBUG_LOG_PATH, "a")
+    if not ok or not f then return end
+    pcall(function()
+        f.writeLine(("[%9.3f][%s] %s"):format(os.clock(), area, tostring(msg)))
+        f.close()
+    end)
+end
+
+local function logf(area, fmt, ...)
+    log(area, string.format(fmt, ...))
+end
+
+-- Scrub credentials from a URL before logging it.
+local function redact_url(url)
+    if not url then return "" end
+    return (tostring(url)
+        :gsub("([?&]p=)[^&]*", "%1***")
+        :gsub("([?&]u=)[^&]*", "%1***"))
+end
+
+pcall(function()
+    local f = fs.open(DEBUG_LOG_PATH, "w")
+    f.writeLine("=== CC:SUBSONIC debug log ===")
+    f.writeLine("Started: " .. tostring(os.date and os.date("%Y-%m-%d %H:%M:%S") or os.epoch("utc")))
+    f.close()
+end)
+
+log("boot", "=== CC:SUBSONIC starting ===")
+
+-- ---------------------------------------------------------------------------
+-- Module loading
+-- ---------------------------------------------------------------------------
 local function ensure_module(name, url)
     local path = LIB_DIR .. "/" .. name .. ".lua"
     if not fs.exists(path) and url then
+        logf("module", "downloading %s from %s", name, url)
         print("Downloading " .. name .. " to " .. path .. " ...")
         local resp = http.get(url)
         if resp then
@@ -30,14 +71,21 @@ local function ensure_module(name, url)
             local f = fs.open(path, "w")
             f.write(data)
             f.close()
+            logf("module", "downloaded %s (%d bytes)", name, #data)
         else
+            logf("module", "download FAILED for %s", name)
             print("Warning: failed to download " .. name)
         end
+    else
+        logf("module", "%s already present at %s", name, path)
     end
+    logf("module", "requiring %s", name)
     local ok, mod = pcall(require, name)
     if not ok then
+        logf("module", "require FAILED for %s: %s", name, tostring(mod))
         error("Could not load module '" .. name .. "': " .. tostring(mod))
     end
+    logf("module", "loaded %s", name)
     return mod
 end
 
@@ -82,29 +130,48 @@ local function normalize_base_url(url)
 end
 
 local function get_json(url)
+    logf("http", "GET json %s", redact_url(url))
     local ok,res = pcall(http.get,url)
-    if not ok or not res then return nil end
+    if not ok or not res then
+        logf("http", "GET json FAILED %s (%s)", redact_url(url), tostring(res))
+        return nil
+    end
     local body = res.readAll()
     res.close()
-    return textutils.unserializeJSON(body)
+    logf("http", "GET json OK   %s (%d bytes)", redact_url(url), #body)
+    local decoded_ok, decoded = pcall(textutils.unserializeJSON, body)
+    if not decoded_ok then
+        logf("http", "JSON decode FAILED for %s: %s", redact_url(url), tostring(decoded))
+        return nil
+    end
+    return decoded
 end
 
 local function read_login()
+    log("login", "read_login: reading /login.txt")
     if not fs.exists("/login.txt") then error("login.txt not found") end
     local f = fs.open("/login.txt","r")
     local user = f.readLine()
     local pass = f.readLine()
     f.close()
     if not user or not pass then error("login.txt invalid") end
+    log("login", "read_login: credentials loaded")   -- deliberately not logging user
     return user,pass
 end
 
 -- Find speaker
 local function find_speaker()
-    return peripheral.find("speaker") or error("No speaker found")
+    local spk = peripheral.find("speaker")
+    if spk then
+        log("audio", "find_speaker: speaker found")
+    else
+        log("audio", "find_speaker: NO SPEAKER FOUND")
+    end
+    return spk or error("No speaker found")
 end
 
 local function load_settings()
+    log("settings", "load_settings: begin")
     local volume = 1.0
     local speed = 1.0
     local mode = nil
@@ -127,6 +194,8 @@ local function load_settings()
             if b and b ~= "" then base_url = b end
         end
         f.close()
+    else
+        log("settings", "load_settings: /musiccache not found, using defaults")
     end
 
     volume = math.max(0.05, math.min(2.0, volume))
@@ -135,6 +204,8 @@ local function load_settings()
     base_url = normalize_base_url(base_url) or DEFAULT_BASE_URL
     BASE_URL = base_url
 
+    logf("settings", "load_settings: volume=%.2f speed=%.2f mode=%s base_url=%s",
+        volume, speed, tostring(mode), tostring(base_url))
     return volume, speed, mode, base_url
 end
 
@@ -143,6 +214,8 @@ local function save_settings(volume, speed, use_monitor, base_url)
     BASE_URL = base_url
 
     local mode_str = use_monitor and "monitor" or "terminal"
+    logf("settings", "save_settings: volume=%.2f speed=%.2f mode=%s base_url=%s",
+        volume, speed, mode_str, tostring(base_url))
     local f = fs.open("/musiccache", "w")
     f.writeLine("volume=" .. tostring(volume))
     f.writeLine("speed=" .. tostring(speed))
@@ -160,14 +233,20 @@ local function shuffle(t)
     return copy
 end
 
-local function send_now_playing(trackId, auth_q)
+-- Fire a "now playing" scrobble asynchronously.  Returns the http handle so
+-- the caller can track it for reaping, or nil on failure.  Does NOT block.
+local function fire_now_playing(trackId, auth_q)
     local url = BASE_URL ..
-        "/rest/scrobble.view?id=" ..
-        urlencode(trackId) ..
+        "/rest/scrobble.view?id=" .. urlencode(trackId) ..
         "&time=" .. tostring(os.epoch("utc")) ..
-        "&submission=false" ..
-        auth_q
-    http.get(url)
+        "&submission=false" .. auth_q
+    local ok, h = pcall(http.request, url)
+    if not ok or not h then
+        logf("scrobble", "fire_now_playing FAILED: %s", tostring(h))
+        return nil
+    end
+    logf("scrobble", "fired id=%s", tostring(trackId))
+    return h
 end
 
 local function bucket_range(bucket)
@@ -200,6 +279,8 @@ end
 
 local function build_palette(rgb_fb, max_samp)
     max_samp = max_samp or 2000
+    logf("palette", "build_palette: begin (max_samp=%d)", max_samp)
+    local t0 = os.clock()
     local fb_h = #rgb_fb
     local fb_w = #rgb_fb[1]
 
@@ -217,6 +298,7 @@ local function build_palette(rgb_fb, max_samp)
     end
 
     if #samples < 2 then
+        logf("palette", "build_palette: too few samples (%d), using grayscale", #samples)
         local pal = {}
         for i = 1, 16 do
             local v = math.floor((i-1)*255/15)
@@ -227,7 +309,6 @@ local function build_palette(rgb_fb, max_samp)
 
     local buckets = {samples}
     while #buckets < 16 do
-        os.sleep(0)
         local best_i, best_sz = 1, #buckets[1]
         for i = 2, #buckets do
             if #buckets[i] > best_sz then best_i,best_sz=i,#buckets[i] end
@@ -245,6 +326,8 @@ local function build_palette(rgb_fb, max_samp)
 
     result[1]  = {255,255,255}
     result[16] = {0,0,0}
+    logf("palette", "build_palette: done (%d samples, %d buckets, %.3fs)",
+        #samples, #buckets, os.clock() - t0)
     return result
 end
 
@@ -258,6 +341,8 @@ local function nearest_idx(r, g, b, palette)
 end
 
 local function quantize_to_canvas(rgb_fb, palette, target_w, target_h)
+    logf("quantize", "quantize_to_canvas: begin (%dx%d)", target_w, target_h)
+    local t0 = os.clock()
     local canvas = {}
     for y = 1, target_h do
         canvas[y] = {}
@@ -266,10 +351,9 @@ local function quantize_to_canvas(rgb_fb, palette, target_w, target_h)
             local idx = nearest_idx(rgb[1], rgb[2], rgb[3], palette)
             canvas[y][x] = 2 ^ idx
         end
-        -- Yield periodically so the network/audio coroutines keep running
-        -- while we quantize a large cover image.
         if y % 8 == 0 then os.sleep(0) end
     end
+    logf("quantize", "quantize_to_canvas: done (%.3fs)", os.clock() - t0)
     return canvas
 end
 
@@ -389,7 +473,6 @@ local function draw_progress(track, input_state)
             if #bar < ui_w then bar = bar .. (" "):rep(ui_w - #bar) end
             write(bar:sub(1, ui_w))
         else
-            -- No bar row: draw the timestamp right-aligned on the Now row.
             local ts
             if duration > 0 then
                 ts = format_time(elapsed) .. "/" .. format_time(duration)
@@ -483,7 +566,7 @@ local function draw_touch_buttons(track, input_state)
             save_settings(input_state.volume, input_state.speed, use_monitor)
             redraw_values()
         end},
-        {width = 5},  -- "1.00x"
+        {width = 5},
         {label = "Spd+", fn = function()
             input_state.speed = math.min(3.0, input_state.speed + 0.01)
             save_settings(input_state.volume, input_state.speed, use_monitor)
@@ -497,7 +580,7 @@ local function draw_touch_buttons(track, input_state)
             save_settings(input_state.volume, input_state.speed, use_monitor)
             redraw_values()
         end},
-        {width = 4},  -- "1.00"
+        {width = 4},
         {label = "Vol+", fn = function()
             input_state.volume = math.min(2.0, input_state.volume + 0.05)
             save_settings(input_state.volume, input_state.speed, use_monitor)
@@ -600,6 +683,9 @@ local function get_cover_art_size(term_w, term_h)
 end
 
 local function update_album_art(track, auth_q)
+    logf("cover", "update_album_art: begin track=%s coverArt=%s",
+        tostring(track and track.title), tostring(track and track.coverArt))
+    local t0 = os.clock()
     local active = get_active_term()
     local term_w, term_h = active.getSize()
     local wide = is_wide_mode(term_w, term_h)
@@ -613,6 +699,7 @@ local function update_album_art(track, auth_q)
     end
 
     if avail_cols < 1 or avail_rows < 1 then
+        log("cover", "update_album_art: not enough space, clearing")
         if current_box then current_box:clear(colors.black); current_box:render() end
         fix_text_colors()
         return
@@ -626,13 +713,16 @@ local function update_album_art(track, auth_q)
     local display = use_monitor and monitor_device or active
     if not current_box or current_box.term ~= display then
         current_box = pixelbox.new(display, colors.black)
+        log("cover", "update_album_art: created new pixelbox")
     end
     if current_box.width ~= canvas_w or current_box.height ~= canvas_h then
         current_box:resize(canvas_w, canvas_h, colors.black)
+        logf("cover", "update_album_art: resized pixelbox to %dx%d", canvas_w, canvas_h)
     end
 
     local cover_id = track.coverArt
     if not cover_id or cover_id == "" then
+        log("cover", "update_album_art: no coverArt, clearing")
         current_box:clear(colors.black)
         current_box:render()
         fix_text_colors()
@@ -641,8 +731,10 @@ local function update_album_art(track, auth_q)
 
     local req_size = get_cover_art_size(term_w, term_h)
     local url = BASE_URL .. "/rest/getCoverArt.view?id=" .. urlencode(cover_id) .. "&size=" .. req_size .. auth_q
+    logf("cover", "update_album_art: GET cover size=%d", req_size)
     local resp, err = http.get(url, {binary=true})
     if not resp then
+        logf("cover", "update_album_art: cover GET FAILED: %s", tostring(err))
         current_box:clear(colors.black)
         current_box:render()
         fix_text_colors()
@@ -650,14 +742,21 @@ local function update_album_art(track, auth_q)
     end
     local img_data = resp.readAll()
     resp.close()
+    logf("cover", "update_album_art: downloaded %d bytes", #img_data)
 
+    log("cover", "update_album_art: jpeg.decode BEGIN")
+    local jt0 = os.clock()
     local ok, src_fb, w, h = pcall(jpeg.decode, img_data)
     if not ok or not src_fb then
+        logf("cover", "update_album_art: jpeg.decode FAILED (%s) in %.3fs",
+            tostring(src_fb), os.clock() - jt0)
         current_box:clear(colors.black)
         current_box:render()
         fix_text_colors()
         return
     end
+    logf("cover", "update_album_art: jpeg.decode OK %dx%d in %.3fs",
+        w, h, os.clock() - jt0)
 
     local scale = math.min(top_pixel_w / w, top_pixel_h / h)
 
@@ -666,9 +765,10 @@ local function update_album_art(track, auth_q)
     local sw = cell_w * 2
     local sh = cell_h * 3
 
+    logf("cover", "update_album_art: scaling to %dx%d (cell %dx%d)", sw, sh, cell_w, cell_h)
     local scaled_rgb = jpeg.scale_fb(src_fb, w, h, sw, sh)
 
-    local palette = build_palette(scaled_rgb, 2000)
+    local palette = build_palette(scaled_rgb, 200)
     for i = 1, 16 do
         local col = palette[i]
         term.setPaletteColour(2^(i-1), col[1]/255, col[2]/255, col[3]/255)
@@ -686,13 +786,12 @@ local function update_album_art(track, auth_q)
         for x = 1, sw do
             current_box.canvas[oy + y - 1][ox + x - 1] = row[x]
         end
-        -- Yield periodically so the audio coroutine is not starved while
-        -- we copy the scaled image into the pixelbox canvas.
         if y % 8 == 0 then os.sleep(0) end
     end
 
     current_box:render()
     fix_text_colors()
+    logf("cover", "update_album_art: DONE in %.3fs", os.clock() - t0)
 end
 
 local function resample_pcm(pcm, speed)
@@ -709,6 +808,10 @@ end
 
 local function play_track_buffered(tr, auth_q, speaker, input_state, volume, speed)
 
+    logf("playback", "play_track_buffered: BEGIN id=%s title=%s",
+        tostring(tr.id), tostring(tr.title))
+    local track_t0 = os.clock()
+
     PrimeUI.clear()
 
     input_state.volume = volume
@@ -722,8 +825,13 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
 
     -- Open the stream before album-art work so buffering can happen concurrently.
     local url = BASE_URL.."/rest/stream.view?id="..urlencode(tr.id).."&format=dfpwm"..auth_q
+    logf("playback", "play_track_buffered: opening stream %s", redact_url(url))
     local resp = http.get(url, {binary=true})
-    if not resp then return false end
+    if not resp then
+        logf("playback", "play_track_buffered: stream open FAILED for %s", tostring(tr.id))
+        return false
+    end
+    log("playback", "play_track_buffered: stream opened, creating dfpwm decoder")
 
     local decoder = require("cc.audio.dfpwm").make_decoder()
     local pcmQueue = {}
@@ -733,12 +841,13 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
     local streaming_done = false
     local stop = false
     local startup_ready = false
-    local next_ping = os.clock() + 10
 
     local target_buffer_samples = math.floor(TARGET_BUFFER_SECONDS * SAMPLE_RATE)
     local start_buffer_samples = math.floor(START_BUFFER_SECONDS * SAMPLE_RATE)
 
-    send_now_playing(tr.id, auth_q)
+    -- Handles for in-flight scrobble requests.  Populated by scrobble_loop,
+    -- drained by http_reaper_loop, cleaned up again after parallel returns.
+    local pending_http = {}
 
     local function enqueue_pcm(pcm)
         local pos = 1
@@ -773,109 +882,195 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
     end
 
     local function network_loop()
+        log("net_loop", "network_loop: START")
+        local reads = 0
+        local decoded_chunks = 0
         while not stop and not streaming_done do
             if buffered_samples < target_buffer_samples then
                 local data = resp.read(NETWORK_READ_SIZE)
                 if not data then
                     streaming_done = true
+                    logf("net_loop", "network_loop: EOF after %d reads, %d decoded chunks",
+                        reads, decoded_chunks)
                     break
                 end
+                reads = reads + 1
                 local pcm = decoder(data)
-                if #pcm > 0 then enqueue_pcm(pcm) end
-                os.sleep(0)
+                if #pcm > 0 then
+                    decoded_chunks = decoded_chunks + 1
+                    enqueue_pcm(pcm)
+                end
             else
                 os.sleep(0.05)
             end
         end
+        logf("net_loop", "network_loop: EXIT (stop=%s streaming_done=%s reads=%d chunks=%d)",
+            tostring(stop), tostring(streaming_done), reads, decoded_chunks)
     end
 
-    -- Draw the UI and bind keys immediately, then wait only on the audio
-    -- buffer. Album art is handled by its own coroutine so a slow cover
-    -- download cannot delay the first sample of the track.
     local function startup_loop()
+        log("startup", "startup_loop: START")
         draw_full_ui(tr)
         draw_touch_buttons(tr, input_state)
         while not stop do
             if buffered_samples >= start_buffer_samples or streaming_done then
                 startup_ready = true
+                logf("startup", "startup_loop: READY (%d/%d samples, streaming_done=%s)",
+                    buffered_samples, start_buffer_samples, tostring(streaming_done))
                 break
             end
-            os.sleep(0.01)
+            os.sleep(0)
         end
         while not stop do os.sleep(0.1) end
+        log("startup", "startup_loop: EXIT")
     end
 
-    -- Runs in parallel with playback. Once the image is on screen, repaint
-    -- the text UI because pixelbox:render() blits a full-terminal canvas
-    -- and wipes whatever was underneath.
     local function album_art_loop()
+        log("cover", "album_art_loop: START")
         pcall(update_album_art, tr, auth_q)
         fix_text_colors()
         draw_full_ui(tr)
         draw_touch_buttons(tr, input_state)
         draw_progress(tr, input_state)
+        log("cover", "album_art_loop: initial paint done")
         while not stop do os.sleep(0.1) end
+        log("cover", "album_art_loop: EXIT")
+    end
+
+    -- Fire the initial scrobble immediately, then a refresh every 30 s.
+    -- http.request() returns instantly; the response is collected by
+    -- http_reaper_loop below.  This coroutine never blocks on the network.
+    local function scrobble_loop()
+        log("scrobble", "scrobble_loop: START")
+        local h = fire_now_playing(tr.id, auth_q)
+        if h then pending_http[h] = true end
+
+        local next_ping = os.clock() + 30
+        while not stop do
+            if os.clock() >= next_ping then
+                local h2 = fire_now_playing(tr.id, auth_q)
+                if h2 then pending_http[h2] = true end
+                next_ping = os.clock() + 30
+            end
+            os.sleep(0.5)
+        end
+        log("scrobble", "scrobble_loop: EXIT")
+    end
+
+    -- Consume http_success / http_failure events and close the matching
+    -- handles we fired above.  Keeps the event queue short and releases
+    -- sockets promptly, regardless of how slow the server is.
+    local function http_reaper_loop()
+        log("reaper", "http_reaper_loop: START")
+        local reaped = 0
+        while not stop do
+            local ev, a = os.pullEvent()
+            if (ev == "http_success" or ev == "http_failure") and pending_http[a] then
+                pending_http[a] = nil
+                pcall(function() a.close() end)
+                reaped = reaped + 1
+            end
+        end
+        logf("reaper", "http_reaper_loop: EXIT (reaped=%d)", reaped)
     end
 
     local function input_loop()
+        log("input", "input_loop: START")
         local action
         while not stop do
             action = PrimeUI.run()
             if action then
+                logf("input", "input_loop: action=%s", tostring(action))
                 stop = input_state.skip_forward or input_state.skip_back or input_state.back
             end
         end
+        log("input", "input_loop: EXIT")
     end
 
     local function audio_loop()
-        while not stop and not startup_ready do
-            if input_state.back or input_state.skip_forward or input_state.skip_back then
-                stop = true
-                break
-            end
-            os.sleep(0.01)
+    log("audio", "audio_loop: START (waiting for startup_ready)")
+    while not stop and not startup_ready do
+        if input_state.back or input_state.skip_forward or input_state.skip_back then
+            stop = true
+            break
+        end
+        os.sleep(0.01)
+    end
+    log("audio", "audio_loop: startup gate passed, beginning playback")
+
+    draw_progress(tr, input_state)
+    local next_progress_update = 0
+    local chunks_played = 0
+    local first_feed_time = nil
+    local total_fed = 0
+
+    while not stop do
+        if os.clock() >= next_progress_update then
+            draw_progress(tr, input_state)
+            next_progress_update = os.clock() + 0.5
+        end
+        if input_state.back or input_state.skip_forward or input_state.skip_back then
+            stop = true
+            break
         end
 
-        draw_progress(tr, input_state)
-        local next_progress_update = 0
-
-        while not stop and (not streaming_done or buffered_samples > 0) do
-            if os.clock() >= next_progress_update then
-                draw_progress(tr, input_state)
-                next_progress_update = os.clock() + 0.5
-            end
-            if next_ping and os.clock() >= next_ping then
-                pcall(send_now_playing, tr.id, auth_q)
-                next_ping = os.clock() + 10
-            end
-            if input_state.back or input_state.skip_forward or input_state.skip_back then
-                stop = true
-                break
-            end
-            if not input_state.paused then
-                local chunk = dequeue_pcm()
-                if chunk then
-                    local adj = resample_pcm(chunk, input_state.speed)
-                    if not speaker.playAudio(adj, input_state.volume) then
-                        put_back_pcm(chunk)
-                        os.sleep(0.01)
-                    else
-                        input_state.elapsed_samples = (input_state.elapsed_samples or 0) + #chunk
-                    end
+        if input_state.paused then
+            os.sleep(0.02)
+        else
+            local chunk = dequeue_pcm()
+            if chunk then
+                local adj = resample_pcm(chunk, input_state.speed)
+                if not speaker.playAudio(adj, input_state.volume) then
+                    put_back_pcm(chunk)
+                    os.sleep(0.005)
                 else
-                    os.sleep(0.01)
+                    if not first_feed_time then first_feed_time = os.clock() end
+                    chunks_played = chunks_played + 1
+                    total_fed = total_fed + #adj              -- post-resample!
+                    input_state.elapsed_samples = (input_state.elapsed_samples or 0) + #chunk
                 end
             else
-                os.sleep(0.01)
+                -- Local queue empty. We're only done when the stream has
+                -- ended AND the speaker has played out everything we fed
+                -- it. The speaker's own buffer lags by several seconds, so
+                -- we use wall-clock math against first_feed_time.
+                if streaming_done then
+                    if not first_feed_time then break end
+                    local speaker_done_at = first_feed_time + total_fed / SAMPLE_RATE
+                    if os.clock() >= speaker_done_at then break end
+                end
+                os.sleep(0.02)
             end
         end
-        stop = true
     end
 
-    parallel.waitForAny(audio_loop, input_loop, network_loop, startup_loop, album_art_loop)
+    local now = os.clock()
+    local expected_end = first_feed_time and (first_feed_time + total_fed / SAMPLE_RATE) or 0
+    logf("audio",
+        "audio_loop: EXIT stop=%s streaming_done=%s buffered=%d chunks_played=%d total_fed=%d expected_end=%.3f now=%.3f",
+        tostring(stop), tostring(streaming_done), buffered_samples,
+        chunks_played, total_fed, expected_end, now)
+    stop = true
+    end
+
+    log("playback", "play_track_buffered: launching parallel loops")
+    parallel.waitForAny(audio_loop, input_loop, network_loop, startup_loop,
+                        album_art_loop, scrobble_loop, http_reaper_loop)
+    logf("playback", "play_track_buffered: all loops done (%.3fs total)", os.clock() - track_t0)
 
     input_state.cancelled = true
     resp.close()
+
+    -- Close any scrobble handles still in flight when the track ended.
+    local stragglers = 0
+    for h in pairs(pending_http) do
+        pcall(function() h.close() end)
+        stragglers = stragglers + 1
+    end
+    if stragglers > 0 then
+        logf("scrobble", "closed %d in-flight handle(s) at track end", stragglers)
+    end
+
     local action = nil
     if input_state.back then
         action = "back"
@@ -884,10 +1079,13 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
     elseif input_state.skip_back then
         action = "skip_back"
     end
+    logf("playback", "play_track_buffered: END action=%s", tostring(action))
     return input_state.volume, input_state.speed, action
 end
 
 local function run_play_queue(tracks, auth_q, start_track)
+    logf("queue", "run_play_queue: BEGIN (%d tracks) start=%s",
+        #tracks, tostring(start_track and start_track.title))
     local queue = {start_track}
     local rest = {}
     local volume, speed = load_settings()
@@ -903,9 +1101,12 @@ local function run_play_queue(tracks, auth_q, start_track)
 
     while true do
         local tr = queue[idx]
+        logf("queue", "run_play_queue: playing idx=%d/%d id=%s title=%s",
+            idx, #queue, tostring(tr.id), tostring(tr.title))
         input_state.paused = false
         local newVol, newSpeed, action = play_track_buffered(tr, auth_q, speaker, input_state, volume, speed)
         if action == "back" then
+            log("queue", "run_play_queue: back requested, returning")
             return
         end
         volume = newVol or volume
@@ -954,6 +1155,7 @@ local function add_common_navigation(display, periph, y, back_action)
 end
 
 local function pick_playlist(playlists)
+    logf("ui", "pick_playlist: %d playlists", #playlists)
     local active, old = prepare_primeui_screen()
     local periph = get_active_periph_name()
     local w, h = active.getSize()
@@ -1021,17 +1223,21 @@ local function pick_playlist(playlists)
 
         local action, value = PrimeUI.run()
         if action == "select" then
+            logf("ui", "pick_playlist: selected %s", tostring(value and value.name))
             finish_primeui_screen(old)
             return value
         elseif action == "switch_mode" then
+            log("ui", "pick_playlist: switch_mode requested")
             finish_primeui_screen(old)
             return "SWITCH_MODE"
         elseif action == "redraw" then
 
         elseif action == "quit" then
+            log("ui", "pick_playlist: quit")
             finish_primeui_screen(old)
             return "EXIT"
         elseif action == "back" then
+            log("ui", "pick_playlist: back")
             finish_primeui_screen(old)
             return nil
         end
@@ -1039,6 +1245,7 @@ local function pick_playlist(playlists)
 end
 
 local function pick_track_paged(tracks)
+    logf("ui", "pick_track_paged: %d tracks", #tracks)
     local active, old = prepare_primeui_screen()
     local periph = get_active_periph_name()
     local w, h = active.getSize()
@@ -1116,17 +1323,21 @@ local function pick_track_paged(tracks)
 
         local action, value = PrimeUI.run()
         if action == "select" then
+            logf("ui", "pick_track_paged: selected %s", tostring(value and value.title))
             finish_primeui_screen(old)
             return value
         elseif action == "play" then
+            logf("ui", "pick_track_paged: play %s", tostring(value and value.title))
             finish_primeui_screen(old)
             return value
         elseif action == "switch_mode" then
+            log("ui", "pick_track_paged: switch_mode requested")
             finish_primeui_screen(old)
             return "SWITCH_MODE"
         elseif action == "redraw" then
 
         elseif action == "back" then
+            log("ui", "pick_track_paged: back to playlists")
             finish_primeui_screen(old)
             return "BACK_TO_PLAYLISTS"
         end
@@ -1135,6 +1346,7 @@ end
 
 local function interactive_login()
 
+    log("login", "interactive_login: BEGIN")
     term.clear()
     term.setCursorPos(1, 1)
     print("Server Configuration")
@@ -1148,9 +1360,11 @@ local function interactive_login()
             local vol, spd = load_settings()
             BASE_URL = normalized
             save_settings(vol, spd, use_monitor, normalized)
+            logf("login", "interactive_login: base URL set to %s", BASE_URL)
             print("Base URL set to: " .. BASE_URL)
             sleep(1)
         else
+            log("login", "interactive_login: invalid URL input")
             print("Invalid URL. Keeping current.")
             sleep(1)
         end
@@ -1165,6 +1379,7 @@ local function interactive_login()
         local user = io.read()
         io.write("Password: ")
         local pass = io.read()
+        log("login", "interactive_login: attempting login")
         local auth_q = build_auth(user, pass)
         local test = get_json(BASE_URL .. "/rest/ping.view?f=json" .. auth_q)
         if test and test["subsonic-response"] and test["subsonic-response"].status == "ok" then
@@ -1172,10 +1387,12 @@ local function interactive_login()
             f.writeLine(user)
             f.writeLine(pass)
             f.close()
+            log("login", "interactive_login: login OK, credentials saved")
             print("Login successful! Saved to login.txt")
             sleep(1)
             return user, pass
         else
+            log("login", "interactive_login: login FAILED")
             print("Login failed! Check username/password.")
             print("Press Enter to retry...")
             io.read()
@@ -1185,6 +1402,7 @@ end
 
 math.randomseed(os.time()+os.clock())
 print("CC:SUBSONIC")
+log("boot", "CC:SUBSONIC banner printed")
 
 pixelbox = ensure_module("pixelbox_lite",
     "https://raw.githubusercontent.com/9551-Dev/pixelbox_lite/master/pixelbox_lite.lua")
@@ -1194,14 +1412,17 @@ jpeg = ensure_module("jpeg_decode",
 local saved_vol, saved_spd, saved_mode, saved_base = load_settings()
 
 print("Scanning for peripherals...")
+log("boot", "scanning for peripherals")
 local found_monitor = false
 for _, side in ipairs(peripheral.getNames()) do
     local ptype = peripheral.getType(side)
+    logf("peripheral", "found %s : %s", side, tostring(ptype))
     print(" - " .. side .. " : " .. ptype)
     if ptype == "monitor" then
         monitor_device = peripheral.wrap(side)
         monitor_device.setTextScale(0.5)
         found_monitor = true
+        logf("peripheral", "using monitor on %s (text scale 0.5)", side)
         print("Monitor found on side: " .. side .. " (text scale 0.5)")
     end
 end
@@ -1210,6 +1431,7 @@ use_monitor = (saved_mode == true)
 
 if found_monitor then
     if saved_mode == nil then
+        log("boot", "no saved display mode, prompting user")
         local active = term.current()
         term.redirect(active)
         PrimeUI.clear()
@@ -1229,11 +1451,14 @@ if found_monitor then
         PrimeUI.timeout(3, function() PrimeUI.resolve("mode", false) end)
         local _, selected = PrimeUI.run()
         use_monitor = selected == true
+        logf("boot", "user selected display mode: %s", use_monitor and "monitor" or "terminal")
         save_settings(saved_vol, saved_spd, use_monitor, saved_base)
     else
+        logf("boot", "using saved display mode: %s", use_monitor and "monitor" or "terminal")
         print("Using saved display mode: " .. (use_monitor and "monitor" or "terminal"))
     end
 else
+    log("boot", "no monitor found, terminal only")
     print("No monitor found. Running in terminal-only mode.")
     use_monitor = false
     monitor_device = nil
@@ -1255,49 +1480,61 @@ if use_monitor and monitor_device then
 end
 
 ::restart_outer::
+log("main", "entering main loop (restart_outer)")
 while true do
-    -- Fetch playlists
+    log("main", "fetching playlists")
     local pls_json = get_json(BASE_URL.."/rest/getPlaylists.view?f=json"..auth_q)
     local playlists = pls_json and pls_json["subsonic-response"] and pls_json["subsonic-response"].playlists and pls_json["subsonic-response"].playlists.playlist
     if not playlists or #playlists == 0 then
+        log("main", "no playlists found, exiting")
         print("No playlists found")
         break
     end
+    logf("main", "got %d playlists", #playlists)
 
     local selected_playlist
     selected_playlist = pick_playlist(playlists)
     if selected_playlist == "SWITCH_MODE" then
+        log("main", "switching display mode")
         use_monitor = monitor_device ~= nil and not use_monitor
         local cur_vol, cur_spd, _, cur_base = load_settings()
         save_settings(cur_vol, cur_spd, use_monitor, cur_base)
         goto restart_outer
     elseif selected_playlist == "EXIT" then
+        log("main", "exiting per user request")
         print("Exiting program.")
         return
     elseif not selected_playlist then
+        log("main", "no playlist selected, exiting")
         break
     end
 
+    logf("main", "fetching tracks for playlist %s", tostring(selected_playlist.id))
     local tracks_json = get_json(BASE_URL.."/rest/getPlaylist.view?id="..urlencode(selected_playlist.id).."&f=json"..auth_q)
     local tracks = tracks_json and tracks_json["subsonic-response"] and tracks_json["subsonic-response"].playlist and tracks_json["subsonic-response"].playlist.entry
     if not tracks or #tracks == 0 then
+        log("main", "no tracks in selected playlist")
         print("No tracks found in this playlist")
         sleep(1)
         goto continue
     end
+    logf("main", "got %d tracks in playlist", #tracks)
 
     while true do
         local chosen
         chosen = pick_track_paged(tracks)
 
         if chosen == "SWITCH_MODE" then
+            log("main", "switching display mode from track picker")
             use_monitor = monitor_device ~= nil and not use_monitor
             local cur_vol, cur_spd, _, cur_base = load_settings()
             save_settings(cur_vol, cur_spd, use_monitor, cur_base)
             goto restart_outer
         elseif chosen == "BACK_TO_PLAYLISTS" then
+            log("main", "back to playlists")
             break
         elseif chosen ~= nil then
+            logf("main", "starting playback: %s", tostring(chosen.title))
             if use_monitor and monitor_device then
                 term.redirect(monitor_device)
                 term.clear()
@@ -1311,3 +1548,5 @@ while true do
 
     ::continue::
 end
+
+log("boot", "=== CC:SUBSONIC exited ===")
