@@ -12,16 +12,12 @@ local TIMESTAMP_RESERVE = 11
 local UI_ROWS_BAR       = 5
 local UI_ROWS_PLAIN     = 4
 local MAX_COVER_SIZE = 128
-
+--ver 2.1.4, i wanna say?
 
 if not fs.exists("/ccsubsonic")     then fs.makeDir("/ccsubsonic") end
 local LIB_DIR = "/ccsubsonic/"
 
 package.path = LIB_DIR .. "/?.lua;" .. package.path
-
--- ---------------------------------------------------------------------------
--- Debug logger
--- ---------------------------------------------------------------------------
 local DEBUG_LOG_PATH = LIB_DIR .. "debug.log"
 local LOG_ENABLED = false
 
@@ -55,10 +51,6 @@ pcall(function()
 end)
 
 log("boot", "=== CC:SUBSONIC starting ===")
-
--- ---------------------------------------------------------------------------
--- Module loading
--- ---------------------------------------------------------------------------
 local function ensure_module(name, url)
     local path = LIB_DIR .. "/" .. name .. ".lua"
     if not fs.exists(path) and url then
