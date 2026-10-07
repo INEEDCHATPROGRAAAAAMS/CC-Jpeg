@@ -3,21 +3,25 @@ local BASE_URL = DEFAULT_BASE_URL
 local CLIENT_NAME = "CCSubsonic"
 local SUBSONIC_VERSION = "1.16.1"
 local NETWORK_READ_SIZE = 65536       -- bytes read from the HTTP stream at once
-local PLAYBACK_CHUNK_SIZE = 4096    -- PCM samples handed to the speaker at once
-local TARGET_BUFFER_SECONDS = 5       -- keep about this much decoded audio locally
-local START_BUFFER_SECONDS = 2        -- do not start playback until this much is ready
+local PLAYBACK_CHUNK_SIZE = 16 * 1024    -- PCM samples handed to the speaker at once
+local TARGET_BUFFER_SECONDS = 1       -- keep about this much decoded audio locally
+local START_BUFFER_SECONDS = 0        -- do not start playback until this much is ready
 local THUMB_ROW_OFFSET = 1
 local SAMPLE_RATE       = 48000
 local TIMESTAMP_RESERVE = 11
 local UI_ROWS_BAR       = 5
 local UI_ROWS_PLAIN     = 4
 local MAX_COVER_SIZE = 128
---ver 2.1.4, i wanna say?
+
 
 if not fs.exists("/ccsubsonic")     then fs.makeDir("/ccsubsonic") end
 local LIB_DIR = "/ccsubsonic/"
 
 package.path = LIB_DIR .. "/?.lua;" .. package.path
+
+-- ---------------------------------------------------------------------------
+-- Debug logger
+-- ---------------------------------------------------------------------------
 local DEBUG_LOG_PATH = LIB_DIR .. "debug.log"
 local LOG_ENABLED = false
 
@@ -51,6 +55,10 @@ pcall(function()
 end)
 
 log("boot", "=== CC:SUBSONIC starting ===")
+
+-- ---------------------------------------------------------------------------
+-- Module loading
+-- ---------------------------------------------------------------------------
 local function ensure_module(name, url)
     local path = LIB_DIR .. "/" .. name .. ".lua"
     if not fs.exists(path) and url then
@@ -139,16 +147,199 @@ local function get_json(url)
     return decoded
 end
 
-local function read_login()
-    log("login", "read_login: reading /login.txt")
-    if not fs.exists("/login.txt") then error("login.txt not found") end
-    local f = fs.open("/login.txt","r")
-    local user = f.readLine()
-    local pass = f.readLine()
+local LOGIN_FILE  = "/login.txt"
+local LOGIN_MAGIC = "CCSUB-ENC-1"
+
+local function bxor(a, b)
+    if bit32 and bit32.bxor then return bit32.bxor(a, b) end
+    local result, bitval = 0, 1
+    while a > 0 or b > 0 do
+        local abit, bbit = a % 2, b % 2
+        if abit ~= bbit then result = result + bitval end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bitval = bitval * 2
+    end
+    return result
+end
+
+local function hash_code(code)
+    local h = 5381
+    for i = 1, #code do
+        h = (h * 33 + string.byte(code, i)) % 2147483647
+    end
+    if h <= 0 then h = 1 end
+    return h
+end
+
+local function make_keystream(seed)
+    local state = seed % 2147483647
+    if state <= 0 then state = 1 end
+    return function()
+        state = (state * 16807) % 2147483647
+        return state % 256
+    end
+end
+
+local function encrypt_text(plain, code)
+    if not plain or plain == "" then return "" end
+    local next_byte = make_keystream(hash_code(code))
+    local out = {}
+    for i = 1, #plain do
+        out[i] = string.format("%02x",
+            bxor(string.byte(plain, i), next_byte()))
+    end
+    return table.concat(out)
+end
+
+local function decrypt_text(hex, code)
+    if not hex or hex == "" then return "" end
+    if #hex % 2 ~= 0 then return nil end
+    local next_byte = make_keystream(hash_code(code))
+    local out = {}
+    for i = 1, #hex, 2 do
+        local b = tonumber(hex:sub(i, i + 1), 16)
+        if not b then return nil end
+        out[#out + 1] = string.char(bxor(b, next_byte()))
+    end
+    return table.concat(out)
+end
+
+local function validate_code(code)
+    if not code or code == "" then return false, "Code is required" end
+    code = tostring(code)
+    if #code < 4  then return false, "Code must be at least 4 characters" end
+    if #code > 32 then return false, "Code must be at most 32 characters" end
+    if not code:match("^%w+$") then
+        return false, "Code must be alphanumeric (A-Z, a-z, 0-9)"
+    end
+    return true
+end
+
+local function read_saved_credentials(code)
+    -- Returns {user=..., pass=...} on success, or nil, reason
+    if not fs.exists(LOGIN_FILE) then return nil, "missing" end
+    local f = fs.open(LOGIN_FILE, "r")
+    local magic = f.readLine()
+    if magic ~= LOGIN_MAGIC then
+        f.close()
+        return nil, "legacy"
+    end
+    local enc_user = f.readLine()
+    local enc_pass = f.readLine()
     f.close()
-    if not user or not pass then error("login.txt invalid") end
-    log("login", "read_login: credentials loaded")   -- deliberately not logging user
-    return user,pass
+    if not enc_user or not enc_pass then return nil, "corrupt" end
+    local user = decrypt_text(enc_user, code)
+    local pass = decrypt_text(enc_pass, code)
+    if not user or not pass or user == "" or pass == "" then
+        return nil, "corrupt"
+    end
+    return { user = user, pass = pass }
+end
+
+local function save_encrypted_credentials(user, pass, code)
+    local f = fs.open(LOGIN_FILE, "w")
+    f.writeLine(LOGIN_MAGIC)
+    f.writeLine(encrypt_text(user, code))
+    f.writeLine(encrypt_text(pass, code))
+    f.close()
+end
+
+-- Prompt for a brand new code (used after a successful fresh login).
+local function prompt_for_new_code()
+    while true do
+        term.clear()
+        term.setCursorPos(1, 1)
+        print("Choose an encryption code for your saved credentials.")
+        print("  - 4 to 32 characters")
+        print("  - Letters and digits only (A-Z, a-z, 0-9)")
+        print("  - Case sensitive")
+        print("  - It is NOT saved anywhere - you must remember it!")
+        print()
+        io.write("New code: ")
+        local c1 = io.read()
+        local ok, err = validate_code(c1)
+        if not ok then
+            print()
+            print("Error: " .. err)
+            sleep(1.6)
+        else
+            io.write("Confirm code: ")
+            local c2 = io.read()
+            if c1 ~= c2 then
+                print()
+                print("Codes did not match. Try again.")
+                sleep(1.6)
+            else
+                return c1
+            end
+        end
+    end
+end
+
+
+local function unlock_saved_credentials()
+    while true do
+        term.clear()
+        term.setCursorPos(1, 1)
+        print("=== CC:SUBSONIC Login ===")
+        print()
+        print("Saved encrypted credentials found.")
+        print()
+        print("Enter your code to unlock, or type one of:")
+        print("  !delete  - forget saved credentials and log in again")
+        print("  !quit    - exit the program")
+        print()
+        io.write("Code: ")
+        local input = io.read() or ""
+
+        if input == "!delete" or input == "!d" then
+            fs.delete(LOGIN_FILE)
+            log("login", "user deleted saved credentials")
+            return nil
+        elseif input == "!quit" or input == "!q" then
+            log("login", "user quit at unlock prompt")
+            return false
+        end
+
+        local creds, reason = read_saved_credentials(input)
+        if not creds then
+            print()
+            if reason == "legacy" then
+                print("Saved credentials use an old plaintext format.")
+                print("Delete and re-enter? [Y/N]")
+                local c = string.lower(io.read() or "")
+                if c == "y" then
+                    fs.delete(LOGIN_FILE)
+                    return nil
+                end
+            else
+                print("Decryption failed - wrong code or corrupted file.")
+                print("Press Enter to try again.")
+                io.read()
+            end
+        else
+            local auth_q = build_auth(creds.user, creds.pass)
+            local test = get_json(BASE_URL .. "/rest/ping.view?f=json" .. auth_q)
+            if test and test["subsonic-response"]
+               and test["subsonic-response"].status == "ok"
+            then
+                log("login", "saved credentials unlocked and verified")
+                return creds.user, creds.pass
+            else
+                print()
+                print("Server rejected the saved credentials.")
+                print("[R]etry  [D]elete and re-enter  [Q]uit")
+                local c = string.lower(io.read() or "")
+                if c == "d" then
+                    fs.delete(LOGIN_FILE)
+                    return nil
+                elseif c == "q" then
+                    return false
+                end
+            end
+        end
+    end
 end
 
 -- Find speaker
@@ -802,6 +993,7 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
 
     logf("playback", "play_track_buffered: BEGIN id=%s title=%s",
         tostring(tr.id), tostring(tr.title))
+
     local track_t0 = os.clock()
 
     PrimeUI.clear()
@@ -815,263 +1007,978 @@ local function play_track_buffered(tr, auth_q, speaker, input_state, volume, spe
     input_state.cancelled = false
     input_state.elapsed_samples = 0
 
-    -- Open the stream before album-art work so buffering can happen concurrently.
-    local url = BASE_URL.."/rest/stream.view?id="..urlencode(tr.id).."&format=dfpwm"..auth_q
-    logf("playback", "play_track_buffered: opening stream %s", redact_url(url))
-    local resp = http.get(url, {binary=true})
+    --------------------------------------------------------------------------
+    -- Open stream
+    --------------------------------------------------------------------------
+
+    local url = BASE_URL .. "/rest/stream.view?id="
+        .. urlencode(tr.id)
+        .. "&format=dfpwm"
+        .. auth_q
+
+    logf("playback", "play_track_buffered: opening stream %s",
+        redact_url(url))
+
+    local resp = http.get(url, {binary = true})
+
     if not resp then
-        logf("playback", "play_track_buffered: stream open FAILED for %s", tostring(tr.id))
+        logf("playback",
+            "play_track_buffered: stream open FAILED for %s",
+            tostring(tr.id))
         return false
     end
-    log("playback", "play_track_buffered: stream opened, creating dfpwm decoder")
+
+    log("playback",
+        "play_track_buffered: stream opened, creating dfpwm decoder")
 
     local decoder = require("cc.audio.dfpwm").make_decoder()
+
+    --------------------------------------------------------------------------
+    -- Playback state
+    --------------------------------------------------------------------------
+
     local pcmQueue = {}
     local queueHead = 1
     local queueTail = 0
     local buffered_samples = 0
+
     local streaming_done = false
     local stop = false
     local startup_ready = false
 
-    local target_buffer_samples = math.floor(TARGET_BUFFER_SECONDS * SAMPLE_RATE)
-    local start_buffer_samples = math.floor(START_BUFFER_SECONDS * SAMPLE_RATE)
+    local target_buffer_samples =
+        math.floor(TARGET_BUFFER_SECONDS * SAMPLE_RATE)
 
-    -- Handles for in-flight scrobble requests.  Populated by scrobble_loop,
-    -- drained by http_reaper_loop, cleaned up again after parallel returns.
+    local start_buffer_samples =
+        math.floor(START_BUFFER_SECONDS * SAMPLE_RATE)
+
+    --------------------------------------------------------------------------
+    -- Detailed audio diagnostics
+    --------------------------------------------------------------------------
+
+    local audio_stats = {
+        feeds = 0,
+
+        -- Number of times playAudio returned false.
+        speaker_full = 0,
+
+        -- Total time spent waiting for speaker_audio_empty.
+        speaker_wait_time = 0,
+
+        -- Longest single wait for speaker_audio_empty.
+        speaker_longest_wait = 0,
+
+        -- Number of times the PCM queue was empty while the stream
+        -- was still capable of producing more audio.
+        queue_starvations = 0,
+
+        -- Total time spent with an empty PCM queue while streaming.
+        queue_starvation_time = 0,
+
+        -- Longest continuous queue starvation.
+        longest_queue_starvation = 0,
+
+        -- Time of the most recent successful playAudio().
+        last_feed_time = nil,
+
+        -- Number of samples successfully handed to the speaker.
+        total_fed = 0,
+
+        -- Time the first buffer was accepted by the speaker.
+        first_feed_time = nil,
+
+        -- Time of the last successful feed.
+        last_success_time = nil,
+
+        -- Samples in the last successfully submitted buffer.
+        last_feed_samples = 0,
+    }
+
+    --------------------------------------------------------------------------
+    -- Handles for in-flight scrobble requests.
+    --------------------------------------------------------------------------
+
     local pending_http = {}
+
+    --------------------------------------------------------------------------
+    -- PCM queue helpers
+    --------------------------------------------------------------------------
 
     local function enqueue_pcm(pcm)
         local pos = 1
         local len = #pcm
+
         while pos <= len and not stop do
-            local take = math.min(PLAYBACK_CHUNK_SIZE, len - pos + 1)
+
+            local take = math.min(
+                PLAYBACK_CHUNK_SIZE,
+                len - pos + 1
+            )
+
             local chunk = {}
+
             for i = 0, take - 1 do
                 chunk[i + 1] = pcm[pos + i]
             end
+
             queueTail = queueTail + 1
             pcmQueue[queueTail] = chunk
             buffered_samples = buffered_samples + #chunk
+
             pos = pos + take
-            if pos <= len then os.sleep(0) end
+
+            if pos <= len then
+                os.sleep(0)
+            end
         end
     end
 
     local function dequeue_pcm()
-        if queueHead > queueTail then return nil end
+        if queueHead > queueTail then
+            return nil
+        end
+
         local chunk = pcmQueue[queueHead]
+
         pcmQueue[queueHead] = nil
         queueHead = queueHead + 1
+
         buffered_samples = buffered_samples - #chunk
+
         return chunk
     end
 
-    local function put_back_pcm(chunk)
-        queueHead = queueHead - 1
-        pcmQueue[queueHead] = chunk
-        buffered_samples = buffered_samples + #chunk
-    end
+    --------------------------------------------------------------------------
+    -- Network / decoder coroutine
+    --------------------------------------------------------------------------
 
     local function network_loop()
+
         log("net_loop", "network_loop: START")
+
         local reads = 0
         local decoded_chunks = 0
+
         while not stop and not streaming_done do
+
             if buffered_samples < target_buffer_samples then
+
                 local data = resp.read(NETWORK_READ_SIZE)
+
                 if not data then
                     streaming_done = true
-                    logf("net_loop", "network_loop: EOF after %d reads, %d decoded chunks",
-                        reads, decoded_chunks)
+
+                    logf(
+                        "net_loop",
+                        "network_loop: EOF after %d reads, %d decoded chunks, buffered=%d",
+                        reads,
+                        decoded_chunks,
+                        buffered_samples
+                    )
+
                     break
                 end
+
                 reads = reads + 1
+
                 local pcm = decoder(data)
+
                 if #pcm > 0 then
                     decoded_chunks = decoded_chunks + 1
+
                     enqueue_pcm(pcm)
+
+                    logf(
+                        "net_loop",
+                        "decoded read=%d pcm=%d buffered=%d target=%d",
+                        reads,
+                        #pcm,
+                        buffered_samples,
+                        target_buffer_samples
+                    )
                 end
+
             else
                 os.sleep(0.05)
             end
         end
-        logf("net_loop", "network_loop: EXIT (stop=%s streaming_done=%s reads=%d chunks=%d)",
-            tostring(stop), tostring(streaming_done), reads, decoded_chunks)
+
+        logf(
+            "net_loop",
+            "network_loop: EXIT stop=%s streaming_done=%s reads=%d chunks=%d buffered=%d",
+            tostring(stop),
+            tostring(streaming_done),
+            reads,
+            decoded_chunks,
+            buffered_samples
+        )
     end
 
+    --------------------------------------------------------------------------
+    -- Startup buffering coroutine
+    --------------------------------------------------------------------------
+
     local function startup_loop()
+
         log("startup", "startup_loop: START")
+
         draw_full_ui(tr)
-        draw_touch_buttons(tr, input_state)
+
         while not stop do
-            if buffered_samples >= start_buffer_samples or streaming_done then
+
+            if buffered_samples >= start_buffer_samples
+                or streaming_done
+            then
                 startup_ready = true
-                logf("startup", "startup_loop: READY (%d/%d samples, streaming_done=%s)",
-                    buffered_samples, start_buffer_samples, tostring(streaming_done))
+
+                logf(
+                    "startup",
+                    "startup_loop: READY (%d/%d samples, streaming_done=%s)",
+                    buffered_samples,
+                    start_buffer_samples,
+                    tostring(streaming_done)
+                )
+
                 break
             end
+
             os.sleep(0)
         end
-        while not stop do os.sleep(0.1) end
+
+        while not stop do
+            os.sleep(0.1)
+        end
+
         log("startup", "startup_loop: EXIT")
     end
 
+    --------------------------------------------------------------------------
+    -- Album art coroutine
+    --------------------------------------------------------------------------
+
     local function album_art_loop()
+
         log("cover", "album_art_loop: START")
+
         pcall(update_album_art, tr, auth_q)
+
         fix_text_colors()
         draw_full_ui(tr)
         draw_touch_buttons(tr, input_state)
         draw_progress(tr, input_state)
+
         log("cover", "album_art_loop: initial paint done")
-        while not stop do os.sleep(0.1) end
+
+        while not stop do
+            os.sleep(0.1)
+        end
+
         log("cover", "album_art_loop: EXIT")
     end
 
-    -- Fire the initial scrobble immediately, then a refresh every 30 s.
-    -- http.request() returns instantly; the response is collected by
-    -- http_reaper_loop below.  This coroutine never blocks on the network.
+    --------------------------------------------------------------------------
+    -- Scrobble coroutine
+    --------------------------------------------------------------------------
+
     local function scrobble_loop()
+
         log("scrobble", "scrobble_loop: START")
+
         local h = fire_now_playing(tr.id, auth_q)
-        if h then pending_http[h] = true end
+
+        if h then
+            pending_http[h] = true
+        end
 
         local next_ping = os.clock() + 30
+
         while not stop do
+
             if os.clock() >= next_ping then
+
                 local h2 = fire_now_playing(tr.id, auth_q)
-                if h2 then pending_http[h2] = true end
+
+                if h2 then
+                    pending_http[h2] = true
+                end
+
                 next_ping = os.clock() + 30
             end
+
             os.sleep(0.5)
         end
+
         log("scrobble", "scrobble_loop: EXIT")
     end
 
-    -- Consume http_success / http_failure events and close the matching
-    -- handles we fired above.  Keeps the event queue short and releases
-    -- sockets promptly, regardless of how slow the server is.
+    --------------------------------------------------------------------------
+    -- HTTP reaper
+    --------------------------------------------------------------------------
+
     local function http_reaper_loop()
+
         log("reaper", "http_reaper_loop: START")
+
         local reaped = 0
+
         while not stop do
+
             local ev, a = os.pullEvent()
-            if (ev == "http_success" or ev == "http_failure") and pending_http[a] then
+
+            if (ev == "http_success" or ev == "http_failure")
+                and pending_http[a]
+            then
                 pending_http[a] = nil
-                pcall(function() a.close() end)
+
+                pcall(function()
+                    a.close()
+                end)
+
                 reaped = reaped + 1
             end
         end
-        logf("reaper", "http_reaper_loop: EXIT (reaped=%d)", reaped)
+
+        logf(
+            "reaper",
+            "http_reaper_loop: EXIT (reaped=%d)",
+            reaped
+        )
     end
 
+    --------------------------------------------------------------------------
+    -- Input coroutine
+    --------------------------------------------------------------------------
+
     local function input_loop()
+
         log("input", "input_loop: START")
+
         local action
+
         while not stop do
+
             action = PrimeUI.run()
+
             if action then
-                logf("input", "input_loop: action=%s", tostring(action))
-                stop = input_state.skip_forward or input_state.skip_back or input_state.back
+
+                logf(
+                    "input",
+                    "input_loop: action=%s",
+                    tostring(action)
+                )
+
+                stop =
+                    input_state.skip_forward
+                    or input_state.skip_back
+                    or input_state.back
             end
         end
+
         log("input", "input_loop: EXIT")
     end
 
-    local function audio_loop()
-    log("audio", "audio_loop: START (waiting for startup_ready)")
-    while not stop and not startup_ready do
-        if input_state.back or input_state.skip_forward or input_state.skip_back then
-            stop = true
-            break
+    --------------------------------------------------------------------------
+    -- UI progress coroutine
+    --
+    -- IMPORTANT:
+    -- This is deliberately separate from audio_feeder().
+    -- The feeder should do nothing except move already-prepared PCM into
+    -- the speaker as quickly as possible.
+    --------------------------------------------------------------------------
+
+    local function progress_loop()
+
+        log("ui", "progress_loop: START")
+
+        local next_progress_update = 0
+
+        while not stop do
+
+            local now = os.clock()
+
+            if now >= next_progress_update then
+
+                draw_progress(tr, input_state)
+
+                next_progress_update = now + 0.5
+            end
+
+            os.sleep(0.05)
         end
-        os.sleep(0.01)
+
+        log("ui", "progress_loop: EXIT")
     end
-    log("audio", "audio_loop: startup gate passed, beginning playback")
 
-    draw_progress(tr, input_state)
-    local next_progress_update = 0
-    local chunks_played = 0
-    local first_feed_time = nil
-    local total_fed = 0
+    --------------------------------------------------------------------------
+    -- Isolated audio feeder
+    --
+    -- This is the only coroutine responsible for feeding the speaker.
+    --
+    -- There are two fundamentally different stalls we want to distinguish:
+    --
+    --   1. SPEAKER FULL:
+    --      playAudio() returned false. The speaker still has audio buffered.
+    --      This is NOT an underrun.
+    --
+    --   2. QUEUE EMPTY:
+    --      There was no PCM available while the network/decoder was still
+    --      capable of producing it. This IS the condition which can cause
+    --      an actual audible underrun.
+    --
+    -- Keeping these separate should make the log tell us exactly where
+    -- the problem is.
+    --------------------------------------------------------------------------
 
-    while not stop do
-        if os.clock() >= next_progress_update then
-            draw_progress(tr, input_state)
-            next_progress_update = os.clock() + 0.5
+    local function audio_feeder()
+
+        log(
+            "audio",
+            "audio_feeder: START (waiting for startup_ready)"
+        )
+
+        ----------------------------------------------------------------------
+        -- Startup gate
+        ----------------------------------------------------------------------
+
+        while not stop and not startup_ready do
+
+            if input_state.back
+                or input_state.skip_forward
+                or input_state.skip_back
+            then
+                stop = true
+                break
+            end
+
+            os.sleep(0.01)
         end
-        if input_state.back or input_state.skip_forward or input_state.skip_back then
-            stop = true
-            break
+
+        if stop then
+            log(
+                "audio",
+                "audio_feeder: stopped before startup_ready"
+            )
+
+            return
         end
 
-        if input_state.paused then
-            os.sleep(0.02)
-        else
-            local chunk = dequeue_pcm()
-            if chunk then
-                local adj = resample_pcm(chunk, input_state.speed)
-                if not speaker.playAudio(adj, input_state.volume) then
-                    put_back_pcm(chunk)
-                    os.sleep(0.005)
-                else
-                    if not first_feed_time then first_feed_time = os.clock() end
-                    chunks_played = chunks_played + 1
-                    total_fed = total_fed + #adj              -- post-resample!
-                    input_state.elapsed_samples = (input_state.elapsed_samples or 0) + #chunk
+        logf(
+            "audio",
+            "audio_feeder: startup gate passed buffered=%d start_target=%d",
+            buffered_samples,
+            start_buffer_samples
+        )
+
+        ----------------------------------------------------------------------
+        -- First UI draw is done outside the feeder.
+        ----------------------------------------------------------------------
+
+        local starvation_start = nil
+
+        ----------------------------------------------------------------------
+        -- Main feeder loop
+        ----------------------------------------------------------------------
+
+        while not stop do
+
+            ------------------------------------------------------------------
+            -- Handle control state without doing any UI work.
+            ------------------------------------------------------------------
+
+            if input_state.back
+                or input_state.skip_forward
+                or input_state.skip_back
+            then
+                logf(
+                    "audio",
+                    "audio_feeder: control stop back=%s skip_forward=%s skip_back=%s",
+                    tostring(input_state.back),
+                    tostring(input_state.skip_forward),
+                    tostring(input_state.skip_back)
+                )
+
+                stop = true
+                break
+            end
+
+            ------------------------------------------------------------------
+            -- Paused:
+            --
+            -- Do not pull more PCM from the queue.
+            -- Already-buffered speaker audio is intentionally allowed to
+            -- continue, matching the existing behaviour.
+            ------------------------------------------------------------------
+
+            if input_state.paused then
+
+                if starvation_start then
+
+                    local ended = os.clock()
+                    local duration = ended - starvation_start
+
+                    audio_stats.queue_starvation_time =
+                        audio_stats.queue_starvation_time + duration
+
+                    if duration > audio_stats.longest_queue_starvation then
+                        audio_stats.longest_queue_starvation = duration
+                    end
+
+                    logf(
+                        "audio",
+                        "QUEUE STARVATION END (pause) duration=%.3fs buffered=%d streaming_done=%s",
+                        duration,
+                        buffered_samples,
+                        tostring(streaming_done)
+                    )
+
+                    starvation_start = nil
                 end
-            else
-                -- Local queue empty. We're only done when the stream has
-                -- ended AND the speaker has played out everything we fed
-                -- it. The speaker's own buffer lags by several seconds, so
-                -- we use wall-clock math against first_feed_time.
-                if streaming_done then
-                    if not first_feed_time then break end
-                    local speaker_done_at = first_feed_time + total_fed / SAMPLE_RATE
-                    if os.clock() >= speaker_done_at then break end
-                end
+
                 os.sleep(0.02)
+
+            else
+
+                ----------------------------------------------------------------
+                -- Pull one PCM chunk from our decoded queue.
+                ----------------------------------------------------------------
+
+                local chunk = dequeue_pcm()
+
+                if not chunk then
+
+                    ------------------------------------------------------------
+                    -- No PCM available.
+                    --
+                    -- If streaming is not finished, this is the condition
+                    -- we're interested in: the feeder has nothing to give
+                    -- the speaker.
+                    ------------------------------------------------------------
+
+                    if not streaming_done then
+
+                        if not starvation_start then
+
+                            starvation_start = os.clock()
+
+                            audio_stats.queue_starvations =
+                                audio_stats.queue_starvations + 1
+
+                            logf(
+                                "audio",
+                                "!!! QUEUE STARVATION START !!! buffered=%d target=%d queue_items=%d",
+                                buffered_samples,
+                                target_buffer_samples,
+                                queueTail - queueHead + 1
+                            )
+                        end
+
+                        -- Yield, but do not sleep for 20ms. The network
+                        -- coroutine needs the CPU again as soon as possible.
+                        os.sleep(0)
+
+                    else
+
+                        --------------------------------------------------------
+                        -- Entire HTTP stream has ended and our PCM queue is
+                        -- empty.
+                        --
+                        -- The final successful playAudio() call may still be
+                        -- inside the speaker. Wait for its actual completion
+                        -- instead of guessing based on wall-clock arithmetic.
+                        --------------------------------------------------------
+
+                        if starvation_start then
+
+                            local ended = os.clock()
+                            local duration = ended - starvation_start
+
+                            audio_stats.queue_starvation_time =
+                                audio_stats.queue_starvation_time + duration
+
+                            if duration > audio_stats.longest_queue_starvation then
+                                audio_stats.longest_queue_starvation = duration
+                            end
+
+                            logf(
+                                "audio",
+                                "QUEUE STARVATION END (EOF) duration=%.3fs buffered=%d",
+                                duration,
+                                buffered_samples
+                            )
+
+                            starvation_start = nil
+                        end
+
+                        if audio_stats.feeds == 0 then
+
+                            log(
+                                "audio",
+                                "audio_feeder: EOF with no audio ever submitted"
+                            )
+
+                            break
+                        end
+
+                        local drain_start = os.clock()
+
+                        logf(
+                            "audio",
+                            "audio_feeder: stream EOF + PCM queue empty; waiting for speaker_audio_empty (feeds=%d total_fed=%d)",
+                            audio_stats.feeds,
+                            audio_stats.total_fed
+                        )
+
+                        os.pullEvent("speaker_audio_empty")
+
+                        local drain_time = os.clock() - drain_start
+
+                        logf(
+                            "audio",
+                            "audio_feeder: final speaker drain complete after %.3fs",
+                            drain_time
+                        )
+
+                        break
+                    end
+
+                else
+
+                    ------------------------------------------------------------
+                    -- We got PCM.
+                    --
+                    -- If we had previously been starved, close that starvation
+                    -- interval now.
+                    ------------------------------------------------------------
+
+                    if starvation_start then
+
+                        local now = os.clock()
+                        local duration = now - starvation_start
+
+                        audio_stats.queue_starvation_time =
+                            audio_stats.queue_starvation_time + duration
+
+                        if duration > audio_stats.longest_queue_starvation then
+                            audio_stats.longest_queue_starvation = duration
+                        end
+
+                        logf(
+                            "audio",
+                            "QUEUE STARVATION END duration=%.3fs buffered=%d streaming_done=%s",
+                            duration,
+                            buffered_samples,
+                            tostring(streaming_done)
+                        )
+
+                        starvation_start = nil
+                    end
+
+                    ------------------------------------------------------------
+                    -- Resample exactly once.
+                    --
+                    -- If playAudio() says the speaker is full, we retain this
+                    -- already-resampled table and retry it. We do NOT put the
+                    -- PCM back into the queue and resample it again.
+                    ------------------------------------------------------------
+
+                    local prepare_start = os.clock()
+
+                    local adj =
+                        resample_pcm(chunk, input_state.speed)
+
+                    local prepare_time =
+                        os.clock() - prepare_start
+
+                    local feed_samples = #adj
+                    local feed_start = os.clock()
+
+                    ------------------------------------------------------------
+                    -- Speaker submission loop.
+                    ------------------------------------------------------------
+
+                    while not stop do
+
+                        local accepted =
+                            speaker.playAudio(
+                                adj,
+                                input_state.volume
+                            )
+
+                        if accepted then
+
+                            local now = os.clock()
+
+                            --------------------------------------------------
+                            -- First successful submission.
+                            --------------------------------------------------
+
+                            if not audio_stats.first_feed_time then
+                                audio_stats.first_feed_time = now
+
+                                logf(
+                                    "audio",
+                                    "FIRST SPEAKER FEED t=%.3f samples=%d buffered_after=%d prepare=%.3fs",
+                                    now - track_t0,
+                                    feed_samples,
+                                    buffered_samples,
+                                    prepare_time
+                                )
+                            end
+
+                            --------------------------------------------------
+                            -- Successful submission.
+                            --------------------------------------------------
+
+                            local gap = 0
+
+                            if audio_stats.last_success_time then
+                                gap =
+                                    now
+                                    - audio_stats.last_success_time
+                            end
+
+                            audio_stats.feeds =
+                                audio_stats.feeds + 1
+
+                            audio_stats.total_fed =
+                                audio_stats.total_fed + feed_samples
+
+                            audio_stats.last_success_time = now
+                            audio_stats.last_feed_time = now
+                            audio_stats.last_feed_samples = feed_samples
+
+                            input_state.elapsed_samples =
+                                (input_state.elapsed_samples or 0)
+                                + #chunk
+
+                            logf(
+                                "audio",
+                                "FEED #%d accepted samples=%d queue_buffered=%d feed_gap=%.3fs prep=%.3fs",
+                                audio_stats.feeds,
+                                feed_samples,
+                                buffered_samples,
+                                gap,
+                                prepare_time
+                            )
+
+                            --------------------------------------------------
+                            -- This chunk is now owned by the speaker.
+                            --------------------------------------------------
+
+                            break
+                        end
+
+                        ----------------------------------------------------------
+                        -- Speaker rejected the buffer.
+                        --
+                        -- This is expected when its single internal buffer
+                        -- still contains audio. It is NOT itself an underrun.
+                        ----------------------------------------------------------
+
+                        local wait_start = os.clock()
+
+                        audio_stats.speaker_full =
+                            audio_stats.speaker_full + 1
+
+                        logf(
+                            "audio",
+                            "SPEAKER FULL #%d: playAudio rejected %d samples; waiting for speaker_audio_empty",
+                            audio_stats.speaker_full,
+                            feed_samples
+                        )
+
+                        os.pullEvent("speaker_audio_empty")
+
+                        local waited =
+                            os.clock() - wait_start
+
+                        audio_stats.speaker_wait_time =
+                            audio_stats.speaker_wait_time + waited
+
+                        if waited > audio_stats.speaker_longest_wait then
+                            audio_stats.speaker_longest_wait = waited
+                        end
+
+                        logf(
+                            "audio",
+                            "SPEAKER READY: waited %.3fs, retrying same buffer (%d samples)",
+                            waited,
+                            feed_samples
+                        )
+                    end
+                end
             end
         end
+
+        ----------------------------------------------------------------------
+        -- If the feeder exits because of a skip/back action, don't classify
+        -- the resulting lack of audio as an underrun.
+        ----------------------------------------------------------------------
+
+        if starvation_start then
+
+            local ended = os.clock()
+            local duration = ended - starvation_start
+
+            audio_stats.queue_starvation_time =
+                audio_stats.queue_starvation_time + duration
+
+            if duration > audio_stats.longest_queue_starvation then
+                audio_stats.longest_queue_starvation = duration
+            end
+
+            logf(
+                "audio",
+                "QUEUE STARVATION END (feeder exit) duration=%.3fs stop=%s",
+                duration,
+                tostring(stop)
+            )
+
+            starvation_start = nil
+        end
+
+        ----------------------------------------------------------------------
+        -- Final diagnostics.
+        ----------------------------------------------------------------------
+
+        local total_time = os.clock() - track_t0
+
+        logf(
+            "audio",
+            "audio_feeder: EXIT stop=%s streaming_done=%s buffered=%d feeds=%d total_fed=%d",
+            tostring(stop),
+            tostring(streaming_done),
+            buffered_samples,
+            audio_stats.feeds,
+            audio_stats.total_fed
+        )
+
+        logf(
+            "audio",
+            "AUDIO DIAGNOSTICS: speaker_full=%d speaker_wait=%.3fs longest_speaker_wait=%.3fs queue_starvations=%d queue_starvation_time=%.3fs longest_queue_starvation=%.3fs runtime=%.3fs",
+            audio_stats.speaker_full,
+            audio_stats.speaker_wait_time,
+            audio_stats.speaker_longest_wait,
+            audio_stats.queue_starvations,
+            audio_stats.queue_starvation_time,
+            audio_stats.longest_queue_starvation,
+            total_time
+        )
+
+        if audio_stats.feeds > 0 then
+
+            local average_feed =
+                audio_stats.total_fed / audio_stats.feeds
+
+            logf(
+                "audio",
+                "AUDIO DIAGNOSTICS: average_feed=%.1f samples (%.3fs), last_feed=%d samples",
+                average_feed,
+                average_feed / SAMPLE_RATE,
+                audio_stats.last_feed_samples
+            )
+        end
+
+        ----------------------------------------------------------------------
+        -- The feeder is authoritative for ending playback.
+        ----------------------------------------------------------------------
+
+        stop = true
     end
 
-    local now = os.clock()
-    local expected_end = first_feed_time and (first_feed_time + total_fed / SAMPLE_RATE) or 0
-    logf("audio",
-        "audio_loop: EXIT stop=%s streaming_done=%s buffered=%d chunks_played=%d total_fed=%d expected_end=%.3f now=%.3f",
-        tostring(stop), tostring(streaming_done), buffered_samples,
-        chunks_played, total_fed, expected_end, now)
-    stop = true
-    end
+    --------------------------------------------------------------------------
+    -- Start all coroutines.
+    --
+    -- audio_feeder is deliberately separate from progress/UI work.
+    --------------------------------------------------------------------------
 
-    log("playback", "play_track_buffered: launching parallel loops")
-    parallel.waitForAny(audio_loop, input_loop, network_loop, startup_loop,
-                        album_art_loop, scrobble_loop, http_reaper_loop)
-    logf("playback", "play_track_buffered: all loops done (%.3fs total)", os.clock() - track_t0)
+    log(
+        "playback",
+        "play_track_buffered: launching parallel loops"
+    )
+
+    parallel.waitForAny(
+        audio_feeder,
+        input_loop,
+        network_loop,
+        startup_loop,
+        album_art_loop,
+        scrobble_loop,
+        http_reaper_loop,
+        progress_loop
+    )
+
+    logf(
+        "playback",
+        "play_track_buffered: all loops done (%.3fs total)",
+        os.clock() - track_t0
+    )
 
     input_state.cancelled = true
+
     resp.close()
 
+    --------------------------------------------------------------------------
     -- Close any scrobble handles still in flight when the track ended.
+    --------------------------------------------------------------------------
+
     local stragglers = 0
+
     for h in pairs(pending_http) do
-        pcall(function() h.close() end)
+
+        pcall(function()
+            h.close()
+        end)
+
         stragglers = stragglers + 1
     end
+
     if stragglers > 0 then
-        logf("scrobble", "closed %d in-flight handle(s) at track end", stragglers)
+        logf(
+            "scrobble",
+            "closed %d in-flight handle(s) at track end",
+            stragglers
+        )
     end
 
+    --------------------------------------------------------------------------
+    -- Determine playback action.
+    --------------------------------------------------------------------------
+
     local action = nil
+
     if input_state.back then
         action = "back"
+
     elseif input_state.skip_forward then
         action = "skip_forward"
+
     elseif input_state.skip_back then
         action = "skip_back"
     end
-    logf("playback", "play_track_buffered: END action=%s", tostring(action))
+
+    --------------------------------------------------------------------------
+    -- Final track diagnostics.
+    --------------------------------------------------------------------------
+
+    logf(
+        "audio",
+        "TRACK AUDIO SUMMARY: feeds=%d total_fed=%d speaker_full=%d speaker_wait=%.3fs queue_starvations=%d starvation_time=%.3fs longest_starvation=%.3fs",
+        audio_stats.feeds,
+        audio_stats.total_fed,
+        audio_stats.speaker_full,
+        audio_stats.speaker_wait_time,
+        audio_stats.queue_starvations,
+        audio_stats.queue_starvation_time,
+        audio_stats.longest_queue_starvation
+    )
+
+    logf(
+        "playback",
+        "play_track_buffered: END action=%s",
+        tostring(action)
+    )
+
     return input_state.volume, input_state.speed, action
 end
 
@@ -1375,13 +2282,16 @@ local function interactive_login()
         local auth_q = build_auth(user, pass)
         local test = get_json(BASE_URL .. "/rest/ping.view?f=json" .. auth_q)
         if test and test["subsonic-response"] and test["subsonic-response"].status == "ok" then
-            local f = fs.open("/login.txt", "w")
-            f.writeLine(user)
-            f.writeLine(pass)
-            f.close()
-            log("login", "interactive_login: login OK, credentials saved")
-            print("Login successful! Saved to login.txt")
+            print()
+            print("Login successful!")
             sleep(1)
+            local code = prompt_for_new_code()
+            save_encrypted_credentials(user, pass, code)
+            log("login", "interactive_login: credentials encrypted and saved")
+            print()
+            print("Encrypted credentials saved to " .. LOGIN_FILE)
+            print("Keep your code safe - it cannot be recovered!")
+            sleep(2)
             return user, pass
         else
             log("login", "interactive_login: login FAILED")
@@ -1457,8 +2367,17 @@ else
 end
 
 local user, pass
-if fs.exists("/login.txt") then
-    user, pass = read_login()
+if fs.exists(LOGIN_FILE) then
+    local u, p = unlock_saved_credentials()
+    if u == false then
+        print("Exiting.")
+        return
+    end
+    if u then
+        user, pass = u, p
+    else
+        user, pass = interactive_login()
+    end
 else
     user, pass = interactive_login()
 end
